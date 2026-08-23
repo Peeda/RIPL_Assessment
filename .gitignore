@@ -1,0 +1,82 @@
+# --- data: all regenerable via download_demo + replay_trajectory -------------
+*.h5
+*.hdf5
+*.zarr/
+demos/
+maniskill_data/
+data/
+*.pkl
+*.npz
+
+# ...but keep the metadata JSONs that document what the demos were.
+!**/trajectory.json
+
+# --- model artifacts ---------------------------------------------------------
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+checkpoints/
+runs/
+outputs/
+logs/
+
+# --- experiment tracking -----------------------------------------------------
+wandb/
+lightning_logs/
+tensorboard/
+events.out.tfevents.*
+
+# --- media -------------------------------------------------------------------
+# Rollout videos go in the submission zip, not in git. Binary, large, and they
+# bloat history permanently. Keep them in videos/ locally so the zip step is
+# a straight copy.
+*.mp4
+*.avi
+*.gif
+*.webm
+videos/
+
+# Figures for the report ARE worth committing - they're small, they're
+# deliverables, and you want them versioned alongside the code that made them.
+!figures/**/*.png
+!figures/**/*.pdf
+
+# --- secrets -----------------------------------------------------------------
+# LLM API keys for T-III, wandb key, R2/S3 credentials.
+.env
+.env.*
+*.key
+secrets.yaml
+credentials*
+.aws/
+
+# --- python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+venv/
+.venv/
+env/
+.python-version
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- os / editor -------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~
+
+# --- runpod / container scratch ----------------------------------------------
+vulkaninfo.txt
+ENVIRONMENT.txt
+smoke/
+nohup.out
