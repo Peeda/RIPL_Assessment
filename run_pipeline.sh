@@ -8,8 +8,10 @@
 #
 # Stages:  data | train | train-rgb | all   (default: all)
 #
-# Every command here is ManiSkill's documented recipe. Nothing is tuned, and
-# nothing should be tuned without a reason written down in CLAUDE.md.
+# Every command here is ManiSkill's documented recipe, with exactly one
+# deliberate deviation: the rgb encoder's global max-pool is off (see
+# POOL_FEATURE_MAP below and patches/0001). Nothing else is tuned, and nothing
+# should be tuned without a reason written down in CLAUDE.md.
 #
 # The predecessor of this file was 311 lines, almost all of it absorbing the
 # fact that PushT ships pre-replayed with a different episode count per control
@@ -39,6 +41,18 @@ NUM_DEMOS=${NUM_DEMOS:-100}
 MAX_EP_STEPS=${MAX_EP_STEPS:-200}
 STATE_ITERS=${STATE_ITERS:-30000}
 RGB_ITERS=${RGB_ITERS:-100000}
+
+# --- deviation from the recipe, see patches/0001 -----------------------------
+# Upstream hardwires PlainConv(pool_feature_map=True), which global-max-pools
+# the encoder's 8x8x128 feature map to one number per channel and discards all
+# spatial layout. Under obs-mode rgb the state vector carries no cube pose, so
+# that is the one thing the encoder has to supply. false keeps the 8x8 grid.
+#
+# Set POOL_FEATURE_MAP=true to reproduce upstream's arm for the A/B.
+# This deviation is free of comparability cost: ManiSkill publishes no DP
+# result for StackCube (learning_from_demos/baselines.md lists DP as WIP), so
+# there is no number to stay comparable to. See CLAUDE.md.
+POOL_FEATURE_MAP=${POOL_FEATURE_MAP:-false}
 
 DEMOS=$MS_ASSET_DIR/demos/$ENV_ID/motionplanning
 STATE_H5=$DEMOS/trajectory.state.$CTRL.$BACKEND.h5
@@ -109,15 +123,48 @@ do_train() {
 
 do_train_rgb() {
   need_wandb
-  stage "rgb training - this checkpoint is the T-I deliverable"
+
+  # The flag only exists once patches/0001 is applied. Without it train_rgbd.py
+  # silently uses the pooled encoder, and the run looks fine for 100k iters
+  # before reporting upstream's number again. Fail here instead.
+  if ! grep -q 'pool_feature_map: bool' "$DP_DIR/train_rgbd.py"; then
+    echo "!! $DP_DIR/train_rgbd.py is stock upstream."
+    echo "   Run 'bash apply_patches.sh' first."
+    exit 1
+  fi
+
+  # Encoder variant is now a variable, so it goes in the run name alongside the
+  # demo count - same reason CLAUDE.md gives for recording --num-demos.
+  if [ "$POOL_FEATURE_MAP" = true ]; then
+    POOL_FLAG=--pool_feature_map;    VARIANT=pooled
+  else
+    POOL_FLAG=--no_pool_feature_map; VARIANT=spatial
+  fi
+
+  # train_rgbd.py derives its output dir from --exp-name alone and overwrites
+  # checkpoints in place with no warning - --num-demos is not in the path. A
+  # hand-edited command that reuses a name silently destroys the earlier run's
+  # weights. CLAUDE.md's rule for datasets applies here too: don't overwrite
+  # without asking.
+  RUN_DIR="$DP_DIR/runs/diffusion_policy-$ENV_ID-rgb-$VARIANT-${NUM_DEMOS}_motionplanning_demos-1"
+  if [ -n "$(ls -A "$RUN_DIR/checkpoints" 2>/dev/null)" ]; then
+    echo "!! $RUN_DIR/checkpoints already has weights."
+    echo "   Training would overwrite them. Pull them off the pod first"
+    echo "   (bash transfer.sh info), then move the directory aside."
+    echo "   Set FORCE_OVERWRITE=1 to proceed anyway."
+    [ "${FORCE_OVERWRITE:-0}" = 1 ] || exit 1
+    echo "   FORCE_OVERWRITE=1 set - proceeding."
+  fi
+
+  stage "rgb training ($VARIANT encoder) - this checkpoint is the T-I deliverable"
   cd "$DP_DIR"
   python train_rgbd.py --env-id "$ENV_ID" \
     --demo-path "$RGB_H5" \
     --control-mode "$CTRL" --sim-backend "$BACKEND" \
     --num-demos "$NUM_DEMOS" --max_episode_steps "$MAX_EP_STEPS" \
-    --total_iters "$RGB_ITERS" --obs-mode "rgb" \
+    --total_iters "$RGB_ITERS" --obs-mode "rgb" "$POOL_FLAG" \
     --demo_type=motionplanning --track \
-    --exp-name "diffusion_policy-$ENV_ID-rgb-${NUM_DEMOS}_motionplanning_demos-1"
+    --exp-name "diffusion_policy-$ENV_ID-rgb-$VARIANT-${NUM_DEMOS}_motionplanning_demos-1"
 }
 
 case "${1:-all}" in

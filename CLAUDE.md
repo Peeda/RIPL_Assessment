@@ -287,6 +287,140 @@ name; if they are absent, evaluation is not running.
 
 ---
 
+## Measured: state works, RGB does not localise (100 demos)
+
+Both from `rollout_log.py` against `best_eval_success_once.pt`, same replay,
+same actions, same control mode — the runs differ only in observation mode.
+
+> **The `success_once` row below is mislabelled and is really `success_at_end`.**
+> `rollout_log.py` read the top-level `info['success']` at the final step;
+> `CPUGymWrapper(record_metrics=True)` nests the real `success_once` under
+> `info['episode']`, and `ignore_terminations=True` means every episode runs to
+> the full horizon, so the top-level key is the end-of-episode value. Fixed —
+> the harness now logs both columns — but these two numbers predate the fix.
+> Since `success_once >= success_at_end` always, the true `success_once` is at
+> least 0.680 / 0.040. Re-measure before either goes in the report, and never
+> compare a pre-fix rollout number against wandb's `eval/success_once`.
+
+| | state | rgb |
+|---|---|---|
+| `success_once` | **0.680** | **0.040** |
+| mean reach error to cubeA | **4 mm** | **86 mm** |
+| corr(cubeA_x, tcp_x) | +0.999 | +0.689 |
+| corr(cubeA_y, tcp_y) | +1.000 | +0.819 |
+| reach-spread / cube-spread | 1.00× | 0.79× (x), 0.84× (y) |
+
+"Reach" is TCP xy at deepest descent — where the policy decided to grasp.
+
+**The RGB failure is localisation, and it is scatter rather than bias.**
+Decomposing the error, shrinkage toward the mean is mild (0.79–0.84×) while the
+error standard deviation is ~109 mm combined. The policy aims in roughly the
+right direction and lands most of a cube-width away. Against a 40 mm cube that
+is a miss. It is **not** blind — correlation of 0.69–0.82 is real visual
+tracking — so "ignores the image" is the wrong diagnosis and was one this repo
+briefly held.
+
+**The state policy at 4 mm is effectively a perfect localiser and still fails
+32% of the time.** That is the more interesting number. Those failures happen
+*downstream of reaching* — grasp, place, release, settle — which is exactly
+what the three partial-success flags in the logging schema separate. **T-II has
+usable material on the state policy today.**
+
+**0.680 also clears the T-I gate**: meaningfully above 0, meaningfully below 1.
+StackCube was the right task choice; the open question is only whether the
+visual policy can be brought to the same place.
+
+### What this does and does not license
+
+- Reach error is a better instrument than success rate for debugging a visual
+  policy: it is continuous, it has a physical scale (mm against a 40 mm cube),
+  and it separates a perception failure from a manipulation failure. Report it.
+- **Correlation alone is misleading here.** r = 0.82 coexists with an 86 mm
+  error, because r is invariant to scale and offset. Always quote the error in
+  mm alongside it.
+- Reach error and `success_once` are separate instruments and both are needed;
+  see the 800-demo result immediately below.
+
+### 800 demos, pooled encoder: `success_once` ≈ 0.43 (recipe otherwise verbatim)
+
+`baselines.sh`'s StackCube rgb line with `--num-demos 800` instead of 100,
+everything else identical. Result: **more demos help a lot, and then stop.**
+
+| demos | encoder | `success_once` |
+|---|---|---|
+| 100 | pooled (upstream) | 0.040 |
+| 800 | pooled (upstream) | **~0.43** (final eval 0.43, best 0.49) |
+
+**The memorisation hypothesis was right** — 0.04 → 0.43 is a real result, no
+longer a guess. Record it; it is a report paragraph on its own.
+
+**But the run converged.** ~21 eval points at `eval_freq=5000` over 100k iters,
+i.e. the schedule completed. Flat from step 60k: the last 40k iterations
+oscillate 0.42–0.49 with no trend, and at `--num_eval_episodes 100` the
+Bernoulli SE is ≈5%, so that entire oscillation is one standard error. At 800
+demos (~88k transitions, `batch_size` 256) 100k iters is ~290 epochs.
+
+**So more iterations will not help, and neither will more demos** — 800 is
+already most of what the replay produces. The remaining gap to the state
+policy's 0.680 is representational, which is what the next section is about.
+Do not spend another 100k-iter run on a data or budget lever.
+
+---
+
+## The RGB encoder throws away position — `patches/0001`
+
+**This is the reason the visual policy plateaus.** It is a property of
+ManiSkill's baseline, not of anything this repo did.
+
+`train_rgbd.py:272-274` hardwires `PlainConv(..., pool_feature_map=True)`, and
+that flag selects `nn.AdaptiveMaxPool2d((1,1))` (`plain_conv.py:56-58`). A
+128×128 image goes through four max-pools to an **8×8×128** feature map, and
+the whole 8×8 grid is then collapsed to **one number per channel** before the
+FC to 256. There are no spatial coordinates left in the representation.
+Position survives only as "which of 128 channels fired" — a coarse code with no
+spatial support.
+
+That is exactly the measured signature: r = 0.69–0.82 (real tracking, not
+blind) with 86 mm mean reach error and σ_err ≈ 109 mm against a **40 mm** cube.
+
+It binds on StackCube specifically because **under `--obs-mode rgb` the state
+vector carries no cube pose.** `stack_cube.py:133-143`:
+
+```python
+obs = dict(tcp_pose=self.agent.tcp.pose.raw_pose)
+if "state" in self.obs_mode:          # <- not taken under rgb
+    obs.update(cubeA_pose=..., cubeB_pose=..., tcp_to_cubeA_pos=..., ...)
+```
+
+So the RGB policy sees `tcp_pose` + `qpos/qvel`, and 100% of cube localisation
+must flow through the pooled encoder. The state policy reaches to 4 mm because
+it is handed the pose; the gap between 0.68 and 0.43 is not "vision is harder",
+it is that the single quantity vision must supply is the one the encoder discards.
+
+**`patches/0001` makes it an `Args` field defaulting to `False`** (spatial map
+kept), rather than flipping the constant, so both arms stay runnable and the
+value reaches wandb's config through `vars(args)` (`train_rgbd.py:453`).
+
+- **Checkpoints are not interchangeable across this flag.** `visual_encoder.fc.0.weight`
+  is `(256, 128)` pooled and `(256, 8192)` spatial. `rollout_log.py` infers which
+  from the weights and configures `Args` to match — do not add a manual flag for it.
+- **`128*4*4*4` in the non-pooled branch is already correct**, since it equals
+  `128*8*8 = 8192` for a 128×128 input. Only the inline `[4,4]` shape comments
+  are stale. Do not "fix" the arithmetic.
+- **`self.aug` is dead code.** `train_rgbd.py:301` guards it with
+  `hasattr(self, "aug")` and nothing ever assigns it, so there is **no image
+  augmentation** anywhere in this baseline. That is the obvious second lever if
+  the encoder change is not enough; it is not part of `patches/0001`.
+
+### Deviating here costs nothing in comparability
+
+The usual objection — "stay on documented hyperparameters so the number is
+comparable" — does not apply, because there is no published DP number for
+StackCube to be comparable to (see above; `baselines.md` lists DP as WIP). The
+recipe buys a sane starting point, not a target. **Report the deviation, the
+before/after, and the mechanism.** A measured architectural fix with an A/B is
+a stronger T-I section than a recipe reproduced without understanding.
+
 ## T-II logging schema
 
 Decide this once, here, and never re-derive it. Angle-wrap conventions are what
@@ -377,7 +511,8 @@ Four files, each with one job:
 |---|---|
 | `setup_runpod.sh` | Builds a fresh pod: packages, Vulkan/EGL ICDs, venv, ManiSkill clone. Writes `env.sh`. Deliberately checks nothing at runtime. |
 | `smoke_test.sh` | Five gates, ~3 min. Sim constructs; renderer emits real pixels; dataset action dim matches; seeds determine initial states; the real evaluate() runs. Gate 4 is T-II's prerequisite. |
-| `run_pipeline.sh` | The recipe. `data` \| `train` \| `train-rgb` \| `all`. |
+| `run_pipeline.sh` | The recipe, plus one deviation (`POOL_FEATURE_MAP`). `data` \| `train` \| `train-rgb` \| `all`. |
+| `apply_patches.sh` | Applies `patches/*.patch` to the ManiSkill checkout. `apply` \| `status` \| `revert`. Idempotent. Run after every `setup_runpod.sh`. |
 | `transfer.sh` | `check` \| `info` \| `send`. Run `check` before anything else on a new pod. |
 
 `ENV_ID` is a variable in both `run_pipeline.sh` and `smoke_test.sh`. The task has
@@ -500,17 +635,33 @@ is load-bearing and Blackwell cards already have an open ManiSkill issue.
 *Volatile — update as work lands.*
 
 - Repo retargeted at StackCube; PushT scripts deleted, its record kept in
-  `notes/pusht-detour.md`.
-- **Nothing has been run on StackCube.** No demos, no datasets, no policy, no
-  measurements. Every number in this repo is from PushT and belongs only to the
-  detour note.
+  `notes/pusht-detour.md`. No PushT number belongs in a StackCube table.
+- **Data and both policies exist.** Demos replayed (state + rgb, ~990 trajs).
+  State: `success_once` **0.680**, 4 mm reach error, 100 demos. RGB: **0.040**
+  at 100 demos, **~0.43** at 800 demos — both on upstream's pooled encoder.
+- **Diagnosed:** the RGB plateau is the encoder's global max-pool discarding
+  spatial layout, not data volume and not training budget. See the two sections
+  above. `patches/0001` turns it off; `run_pipeline.sh` defaults to the spatial
+  encoder and records the variant in the run name.
 - Hyperparameters, demo availability and the initial-state distribution are all
-  now verified from source (see above) rather than open. A shallow ManiSkill
-  checkout lives at `~/ripl/ManiSkill` on the laptop for exactly this — read
-  source locally instead of burning pod time on it.
-- Next: `bash smoke_test.sh` (gates 1, 2, 4, 5 pass without a dataset; 3 skips),
-  `bash run_pipeline.sh data`, `bash smoke_test.sh` again for gate 3, then the
-  state training run.
+  verified from source. A shallow ManiSkill checkout lives at `~/ripl/ManiSkill`
+  on the laptop for exactly this — read source locally instead of burning pod
+  time on it. Keep it **stock**: `apply_patches.sh revert` after any local test,
+  or local source-reading stops matching upstream.
+- **Next, in order:**
+  1. `bash apply_patches.sh` on the pod (after `setup_runpod.sh`, which
+     re-clones ManiSkill and wipes the patch).
+  2. `rollout_log.py` on the *existing* 800-demo pooled checkpoint. Two numbers
+     decide what the encoder change has to beat: **reach error** (still ~86 mm →
+     localisation is confirmed binding) and **`success_at_end` vs
+     `success_once`** (a large gap is unstable placement, a distinct T-II mode;
+     a small gap with low `success_once` is timeouts against
+     `max_episode_steps 200`). Do this before the retrain — it is minutes, and
+     it is the A/B's baseline row.
+  3. `NUM_DEMOS=800 bash run_pipeline.sh train-rgb` — spatial encoder, same
+     100k schedule, so the only changed variable is the encoder.
+  4. Re-run `rollout_log.py` on the new checkpoint and put the two rows side by
+     side.
 
 **The gate on everything downstream** is a state-obs policy with success
 meaningfully above 0 *and* meaningfully below 1. Above 0 is what PushT never

@@ -1,0 +1,47 @@
+Subject: [PATCH] diffusion_policy: make PlainConv's global max-pool optional
+
+train_rgbd.py hardcodes PlainConv(pool_feature_map=True), which selects
+nn.AdaptiveMaxPool2d((1,1)) and collapses the encoder's 8x8x128 feature map
+to a 128-vector before the FC. Every spatial coordinate is discarded; cube
+position can only survive as "which channels fired".
+
+On StackCube-v1 that is the binding constraint: under obs-mode rgb the state
+vector carries tcp_pose + qpos/qvel and no cube pose (stack_cube.py:135), so
+all cube localisation must flow through this encoder. Measured at 100 demos:
+corr(cubeA, reach target) 0.69-0.82 with 86 mm mean reach error against a
+40 mm cube -- real but coarse tracking, the signature of a position code with
+no spatial support.
+
+Exposed as an Args field rather than flipped in place so both arms stay
+runnable and the value lands in wandb's config via vars(args). Default False
+(spatial map kept); pass --pool_feature_map to reproduce upstream's recipe.
+
+No shape fix is needed on the non-pooled branch: its FC input is written
+128*4*4*4 = 8192, which equals 128*8*8 for a 128x128 input. Only the inline
+[4,4] shape comments are stale.
+
+--- a/examples/baselines/diffusion_policy/train_rgbd.py
++++ b/examples/baselines/diffusion_policy/train_rgbd.py
+@@ -83,6 +83,12 @@
+     n_groups: int = (
+         8  # jigu says it is better to let each group have at least 8 channels; it seems 4 and 8 are simila
+     )
++    pool_feature_map: bool = False
++    """whether the visual encoder global-max-pools its feature map to a single
++    vector per channel. True is upstream's setting and discards all spatial
++    layout; False keeps the 8x8 grid (FC input 8192 instead of 128), which is
++    what a task needs when object position is only available from pixels.
++    Checkpoints are NOT interchangeable across this flag."""
+ 
+     # Environment/experiment specific arguments
+     obs_mode: str = "rgb+depth"
+@@ -270,7 +276,8 @@
+ 
+         visual_feature_dim = 256
+         self.visual_encoder = PlainConv(
+-            in_channels=total_visual_channels, out_dim=visual_feature_dim, pool_feature_map=True
++            in_channels=total_visual_channels, out_dim=visual_feature_dim,
++            pool_feature_map=args.pool_feature_map
+         )
+         self.noise_pred_net = ConditionalUnet1D(
+             input_dim=self.act_dim,  # act_horizon is not used (U-Net doesn't care)
