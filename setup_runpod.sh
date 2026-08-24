@@ -164,13 +164,25 @@ fi
 uv pip install --python "$VENV/bin/python" \
   torch torchvision --index-url https://download.pytorch.org/whl/cu124
 
+# gymnasium is PINNED BELOW 1.0 on purpose. Do not relax it.
+#
+# Gymnasium 1.0 removed final_info/final_observation from vector envs and
+# changed autoreset to NEXT_STEP. ManiSkill's GPU wrapper synthesises
+# final_info itself so it survives either version, but the CPU path uses stock
+# gym.vector.AsyncVectorEnv, and every baseline's evaluate() reads
+# info["final_info"] unconditionally. Under gymnasium >= 1.0 with
+# --sim-backend physx_cpu that is a KeyError at the first eval, after training
+# has already started.
+#
+# ManiSkill itself declares gymnasium>=0.29.1 and branches on IS_GYMNASIUM_1,
+# so 0.29.1 is a supported configuration, not a downgrade hack.
 uv pip install --python "$VENV/bin/python" \
   mani_skill \
   h5py tqdm wandb tensorboard \
   imageio imageio-ffmpeg opencv-python-headless \
   matplotlib pandas scipy \
   diffusers huggingface_hub \
-  tyro "gymnasium>=1.1" \
+  tyro "gymnasium==0.29.1" \
   ipykernel jupyterlab
 
 # The pip package ships no examples/baselines. Clone for the diffusion_policy
@@ -208,16 +220,20 @@ echo "=============================================================="
 echo "STEP 7 — version report (record these for your README)"
 echo "=============================================================="
 python - <<'PY'
-import torch, mani_skill, sapien
+import torch, mani_skill, sapien, gymnasium
 print(f"  torch       {torch.__version__}  cuda_available={torch.cuda.is_available()}")
 print(f"  mani_skill  {mani_skill.__version__}")
 print(f"  sapien      {sapien.__version__}")
+print(f"  gymnasium   {gymnasium.__version__}")
+assert gymnasium.__version__ < "1.0.0", (
+    "gymnasium >= 1.0 breaks every physx_cpu eval with KeyError: 'final_info'. "
+    "Something re-resolved it upward; reinstall gymnasium==0.29.1.")
 PY
 {
   echo "gpu:    $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
   echo "driver: $(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)"
   echo "vulkan: $(grep -m1 deviceName "$ROOT/vulkaninfo.txt" | xargs)"
-  "$VENV/bin/python" -c "import torch,mani_skill,sapien; print(f'torch: {torch.__version__}'); print(f'mani_skill: {mani_skill.__version__}'); print(f'sapien: {sapien.__version__}')"
+  "$VENV/bin/python" -c "import torch,mani_skill,sapien,gymnasium; print(f'torch: {torch.__version__}'); print(f'mani_skill: {mani_skill.__version__}'); print(f'sapien: {sapien.__version__}'); print(f'gymnasium: {gymnasium.__version__}')"
 } > "$ROOT/ENVIRONMENT.txt"
 echo "  saved to $ROOT/ENVIRONMENT.txt"
 

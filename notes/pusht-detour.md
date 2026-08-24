@@ -52,6 +52,20 @@ Two reasons pointing the same way:
 1. The maintainers use `pd_ee_delta_pos` for their RGB baselines (and
    `pd_ee_delta_pose` for state), so it keeps the T-I number comparable to what
    they publish.
+
+   **This turned out to be wrong, and it is worth recording that it was.** Read
+   afterwards from `examples/baselines/diffusion_policy/baselines.sh`: the PushT
+   state baseline uses `pd_ee_delta_pose` on `physx_cuda`, and **there is no
+   PushT RGB baseline at all**. So the entire PushT effort was run under a
+   control mode the maintainers do not use for that task, against a published
+   number that does not exist. The tuned PushT line also carries
+   `--act_horizon 1` and `--num_eval_envs 100`, neither of which was picked up.
+
+   The lesson is not about PushT. It is that this claim was asserted from
+   recollection and propagated through three files and several days of work
+   without anyone opening `baselines.sh` — a file that was on the pod the whole
+   time. Reason 2 below is the one that actually held.
+
 2. T-IV's residual is `a = a_base + clip(Δ, −α, α)`, and α is a physical bound in
    action space. Under translation-only control it bounds a displacement in
    metres, full stop. Under 6-DoF, one scalar bounds translation *and* rotation,

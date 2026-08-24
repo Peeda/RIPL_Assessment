@@ -40,13 +40,14 @@ numbers into a StackCube table.
 
 | Decision | Value | Why |
 |---|---|---|
-| Task | `StackCube-v1`, `motionplanning` demos | One raw `trajectory.h5`, a published DP recipe, and — unlike `PushCube-v1` — not saturated, so T-II has failures to characterise. |
+| Task | `StackCube-v1`, `motionplanning` demos | One raw `trajectory.h5`, a tuned DP *command* in `baselines.sh`, and — unlike `PushCube-v1` — not saturated. Note: **no published success numbers exist**, see below. |
 | Control mode | `pd_ee_delta_pos` (**4-dim: 3 translation + gripper**) | Matches the published recipe. T-IV's α is only a coherent physical bound when what it bounds is a displacement in metres — see the residual row. |
 | Replay flag | **`--use-first-env-state`** | Motionplanning demos are recorded under `pd_joint_pos`, so replay is a control-mode *conversion* and must simulate forward from the initial state. **This reverses the PushT rule**; see below. |
 | Backend | `physx_cpu` everywhere | Matches the published recipe. Replay and eval backends must still match each other — the backend is in the output filename for that reason. |
 | T-IV residual | 3 translation dims only; gripper passes through | See below. |
+| gymnasium | **`==0.29.1`, pinned below 1.0** | 1.0 removed `final_info` from vector envs. The CPU baseline eval path reads it unconditionally, so `physx_cpu` + gymnasium≥1.0 = `KeyError` at the first eval. See traps. |
 | Failure filtering | never `--allow-failure` | Training IL on failed demonstrations is worse than training on fewer. |
-| Demos / steps / iters | 100 / README / README | Copy the baselines README verbatim. Do not invent hyperparameters; documented ones are why this task was chosen. |
+| Demos / steps / iters | 100 / 200 / **30k state, 100k rgb** | From `baselines.sh`. The two runs do NOT share `total_iters`. `--num-demos` is the one of these that is a free lever — see below. |
 
 ### The replay flag reverses — read this before "fixing" it back
 
@@ -85,27 +86,204 @@ what you think it is.
 
 ---
 
-## Open questions — resolve on the pod before the first real run
+## The task, as read from source
 
-These are unverified. Read them off the source rather than trusting this file.
+Verified against a local ManiSkill checkout (`~/ripl/ManiSkill`, shallow clone at
+`62ff3a5`). Re-read rather than trusting this if the pod's version differs.
 
-1. **Does `download_demo StackCube-v1` serve motionplanning demos?** If not,
-   generate them: `python -m mani_skill.examples.motionplanning.panda.run -e
-   StackCube-v1 --num-traj 1000`. `run_pipeline.sh` tries the download and falls
-   back, printing which ran.
-2. **The published hyperparameters.** `run_pipeline.sh`'s `MAX_EP_STEPS` and
-   `TOTAL_ITERS` are placeholders. Copy the StackCube line from
-   `$MANISKILL_REPO/examples/baselines/diffusion_policy/README.md` and patch both
-   the script and this table.
-3. **StackCube's initial-state sampler.** Read `_initialize_episode` in the task
-   file and write down the actual support. It is believed to reject
-   configurations where the cubes spawn closer than some minimum XY distance — if
-   so the default distribution is truncated *exactly where the failures are*.
-   That is not a problem; it is T-III's job description, and it means T-III's
-   sampler has real work to do rather than merely reweighting.
-4. **Eval cost at 100 envs.** The "essentially free" result in
-   `notes/pusht-detour.md` was measured on `physx_cuda`. This pipeline is
-   `physx_cpu`. Smoke gate 4 prints ms/step; measure before assuming.
+**Demos.** `StackCube-v1` is in `download_demo.py`'s `DATASET_SOURCES`, so the
+download is the expected path; the motion planner is only a fallback.
+
+**Hyperparameters** — from `examples/baselines/diffusion_policy/baselines.sh`,
+which is the tuned source, not the README (the README only shows PickCube):
+
+| | state | rgb |
+|---|---|---|
+| `--num-demos` | 100 | 100 |
+| `--max_episode_steps` | 200 | 200 |
+| `--total_iters` | **30000** | **100000** |
+
+**The two runs do not share `total_iters`.** RGB trains 3.3× longer. This is the
+one number that would have been silently wrong.
+
+`max_episode_steps 200` sits against a **registered default of 50** — the README's
+rule is ~2× mean demonstration length, and motionplanning demos are slow.
+
+**Robot** is `panda_wristcam` by default, so RGB observations carry a wrist camera
+alongside the 128×128 base camera.
+
+**Success is three-part**, from `StackCubeEnv.evaluate()`: cubeA on cubeB within
+±5 mm in xy and z, cubeA static, **and cubeA not grasped** — the robot must let go.
+So "stacked but still holding it" and "stacked but knocked over" are failures, and
+they are distinguishable. See the logging schema below.
+
+**A dense reward already exists** (`compute_dense_reward`, 8-stage: reach → grasp
+→ place → ungrasp+static). T-III's LLM-generated reward has a real baseline to be
+compared against rather than invented in a vacuum. Do not delete this observation;
+it is a report paragraph.
+
+### The initial-state distribution — T-II's whole substrate
+
+From `_initialize_episode`:
+
+```python
+xy = torch.rand((b, 2)) * 0.2 - 0.1        # ONE shared offset, both cubes
+region = [[-0.1, -0.2], [0.1, 0.2]]
+radius = ||[0.02, 0.02]|| + 0.001          # = 29.3 mm
+cubeA_xy = xy + sampler.sample(radius, 100)
+cubeB_xy = xy + sampler.sample(radius, 100)
+```
+
+Three consequences, all of which matter:
+
+1. **The shared `xy` offset cancels in the relative pose.** Separation and relative
+   yaw are statistically independent of where the pair sits on the table. The
+   failure axis is therefore genuinely 2-D and not confounded with reach distance —
+   a much cleaner T-II story than PushT would have given.
+2. **`UniformPlacementSampler` rejection-samples** at `fixtures_radii + radius`, so
+   the enforced minimum centre separation is **58.6 mm** for **40 mm** cubes. That
+   only excludes physical overlap; it does *not* exclude the interesting regime.
+3. **The failure region is inside the nominal support.** Simulating the sampler
+   directly (200k draws):
+
+   | | separation |
+   |---|---|
+   | enforced minimum | 58.6 mm |
+   | p1 / p5 / p10 | 61 / 71 / 82 mm |
+   | median | 162 mm |
+   | max | 437 mm |
+
+   `P(sep < 80 mm) ≈ 9%`, `P(sep < 70 mm) ≈ 4.6%`. With cubes 40 mm wide, a
+   sub-80 mm separation leaves under 40 mm of clear space between faces, which is
+   about what the Panda's gripper needs to descend without fouling the other cube.
+
+   **This is the T-II hypothesis to test first**, and it is testable on nominal
+   rollouts — no sampler override needed to *find* the region, only to *over-sample*
+   it, which is exactly T-III's job.
+
+Treat the 9% as a prior, not a result. It says the region is reachable at n=100
+(≈9 episodes), which is too few for a per-region success rate — hence T-II's
+requirement to resample fresh episodes from the region rather than reusing the
+rollouts that identified it.
+
+### Still open
+
+- **Eval cost.** The "100 envs is essentially free" result in
+  `notes/pusht-detour.md` was measured on `physx_cuda` and **does not apply
+  here at all**: `physx_cpu` raises `RuntimeError` for `num_envs > 1` and
+  vectorises by *subprocess* instead (`gym.vector.AsyncVectorEnv`, forkserver,
+  one process per env, via `make_eval_envs`). So eval cost scales with CPU
+  cores, not with batch width, and `--num_eval_envs` is a process count. Leave
+  it at train.py's default of 10 unless the pod has cores to spare. Smoke gate 4
+  prints single-env ms/step; divide by the process count.
+- **Where the base policy actually lands.** Needs to be above 0 and below 1. See
+  Current state.
+
+---
+
+## There is no published DP success number to compare against
+
+`docs/source/user_guide/learning_from_demos/baselines.md` lists Diffusion
+Policy with **Results: WIP**. Same for BC, ACT, RFCL, RLPD. So `baselines.sh`
+is a set of *tuned commands*, not a set of *verified results*, and there is no
+maintainer figure for StackCube DP — state or rgb.
+
+This matters more than it sounds, because "stay on documented hyperparameters"
+was justified by comparability to published numbers. Those numbers do not
+exist. What the recipe still buys is a sane starting point that someone tuned;
+what it does not buy is a target. Concretely:
+
+- **A low number cannot be called a bug by comparison.** It can only be judged
+  against what the task needs, which here is T-II's requirement: meaningfully
+  above 0 and meaningfully below 1.
+- **`--num-demos 100` is a free lever.** The replay produces ~990 trajectories
+  and the recipe uses 100 of them; the rest are already on disk. For a state
+  policy 100 is plainly enough. A visual policy also has to learn perception
+  from roughly 100 × ~110 ≈ 11k frames, which is not obviously enough. Raising
+  it is cheap, does not touch the LR schedule, and costs only dataloading and
+  memory.
+- Record the demo count with every number, since it is now a variable.
+
+---
+
+## `total_iters` is an LR hyperparameter, not a budget
+
+`train.py` uses a diffusers cosine schedule with 500 steps of linear warmup,
+stepped every batch (`train.py:343-347`, `:414`):
+
+```python
+get_scheduler(name='cosine', num_warmup_steps=500,
+              num_training_steps=args.total_iters)
+```
+
+So `--lr 1e-4` is the **peak**, not a constant: 0 → 1e-4 over 500 iters, then
+cosine decay to **0** at `total_iters`.
+
+| iter | state (30k) | rgb (100k) |
+|---|---|---|
+| 500 | 1.00e-4 | 1.00e-4 |
+| 15,000 | 5.13e-5 | 9.49e-5 |
+| 30,000 | 0 | 7.98e-5 |
+
+Because the schedule is tied to `total_iters`:
+
+- **Early-stopping a long run ≠ a short run.** Killing the 100k rgb run at 30k
+  leaves the weights at 8e-5, 80% of peak, with none of the low-LR annealing
+  that usually gives the last quality gain. Not comparable to a 30k-scheduled
+  run, and not the published recipe.
+- **A run cannot be extended** by raising `total_iters` — that resumes under a
+  different LR trajectory.
+- **The state and rgb runs are on deliberately different schedules.** That comes
+  from `baselines.sh`; it is a second reason those two numbers stay separate
+  variables in `run_pipeline.sh`.
+
+The PushT-era instinct "set iters high, watch, stop when flat" is therefore
+**wrong here**. If a run is too long, shorten `total_iters` and rerun from
+scratch — do not truncate. A flat success curve mid-run is expected while the
+LR is still high; judge convergence at the schedule's end, not from the plateau.
+
+---
+
+## What the T-I number actually is
+
+`train.py` logs eval metrics through a tensorboard `SummaryWriter` with
+`wandb.init(sync_tensorboard=True)`, so in wandb they appear namespaced as
+**`eval/<key>`**. There is no metric called "success rate". The keys, from
+`CPUGymWrapper` (`mani_skill/utils/wrappers/gymnasium.py:59-83`):
+
+| wandb key | meaning |
+|---|---|
+| `eval/success_once` | task succeeded at **any** step of the episode |
+| `eval/success_at_end` | task was in a success state at the **final** step |
+| `eval/fail_once`, `eval/fail_at_end` | same, for the failure criterion |
+| `eval/return`, `eval/reward`, `eval/episode_len` | sparse-reward sums |
+
+`success_at_end` exists only because `make_eval_envs` sets
+`ignore_terminations=True`, which runs every episode to the full horizon
+instead of stopping at first success.
+
+**Decide once: `success_once` is the reported T-I number.** It is what
+ManiSkill's published baselines report, so it is the only one comparable to
+them, and T-IV's before/after must use the same key.
+
+**But record both, and say so in the report**, because on StackCube they can
+genuinely differ. Success requires cubeA on cubeB *and* static *and* released —
+a cube that is stacked at step 120 and topples by step 200 scores
+`success_once=1`, `success_at_end=0`. A large gap between the two is not noise;
+it is a real failure mode (unstable placement), and it is a T-II candidate in
+its own right, distinct from the separation-based one.
+
+**Eval cadence.** `--eval_freq` defaults to 5000 and `baselines.sh` does not
+override it, so 30k iters gives ~7 points. That is a coarse curve for a T-I
+plot. Lowering it to 1000 does not change training — it costs wall clock and
+gives `save_on_best_metrics` more chances to catch a good checkpoint — so it is
+a safe deviation if the curve matters. `--num_eval_episodes` is 100 by default,
+which is the assignment's rollout count.
+
+**If a metric is missing from wandb, check the stdout log first.**
+`evaluate_and_save_best` prints every key it computes. If `success_once:` lines
+are in the log, evaluation is fine and the question is wandb sync or the key
+name; if they are absent, evaluation is not running.
 
 ---
 
@@ -119,17 +297,24 @@ Per episode, log:
 ```
 {seed, env_idx, cubeA_x, cubeA_y, cubeA_theta,
                 cubeB_x, cubeB_y, cubeB_theta,
- separation, relative_yaw, success, ep_len}
+ separation, relative_yaw, ep_len,
+ success, is_cubeA_grasped, is_cubeA_on_cubeB, is_cubeA_static}
 ```
 
 - `separation` is XY Euclidean distance between cube centres (metres).
 - `relative_yaw` is `cubeB_theta − cubeA_theta`.
 - **All angles wrapped to `(−π, π]`.** Both the absolute thetas and the relative
   yaw. Wrap once at log time, never at analysis time.
+- The last three flags come free from `evaluate()`'s returned info dict. **Log
+  them.** They turn a binary failure into a three-way taxonomy at zero cost:
+  never grasped / grasped but misplaced / placed but not released or not settled.
+  Two "failure modes" that differ in which flag is false are genuinely different
+  modes, and that distinction is most of what T-II is being graded on.
 
 `separation` and `relative_yaw` are the hypothesised failure axes: too close and
 the grasp approach on A collides with B; too far and the place phase runs out of
-steps. Success-rate-versus-separation is the curve T-II is looking for.
+steps. Success-rate-versus-separation is the curve T-II is looking for, and the
+prior from the sampler (above) says ~9% of nominal episodes land under 80 mm.
 
 **Log full initial states + success flags for every rollout, always** — including
 diagnostic runs. T-II is near-impossible to do well retroactively without this.
@@ -176,6 +361,10 @@ $MS_ASSET_DIR     $RIPL_ROOT/maniskill_data
 demos             $MS_ASSET_DIR/demos/StackCube-v1/motionplanning
 diffusion policy  $MANISKILL_REPO/examples/baselines/diffusion_policy
 this repo         ~/RIPL_Assessment   (note: outside /workspace)
+
+On the laptop, for reading source without a pod:
+~/ripl/ManiSkill    shallow clone, no install needed
+~/ripl/demos        rsync target for pulled datasets
 ```
 
 ---
@@ -187,12 +376,41 @@ Four files, each with one job:
 | | |
 |---|---|
 | `setup_runpod.sh` | Builds a fresh pod: packages, Vulkan/EGL ICDs, venv, ManiSkill clone. Writes `env.sh`. Deliberately checks nothing at runtime. |
-| `smoke_test.sh` | Four gates, ~3 min. Sim constructs; renderer emits real pixels; dataset action dim matches the env; seeds determine initial states. Gate 4 is T-II's prerequisite. |
+| `smoke_test.sh` | Five gates, ~3 min. Sim constructs; renderer emits real pixels; dataset action dim matches; seeds determine initial states; the real evaluate() runs. Gate 4 is T-II's prerequisite. |
 | `run_pipeline.sh` | The recipe. `data` \| `train` \| `train-rgb` \| `all`. |
 | `transfer.sh` | `check` \| `info` \| `send`. Run `check` before anything else on a new pod. |
 
 `ENV_ID` is a variable in both `run_pipeline.sh` and `smoke_test.sh`. The task has
 changed once; changing it again should cost one export, not a rename.
+
+---
+
+## Changing the pod's python environment
+
+`setup_runpod.sh` is **safe to rerun** and does apply dependency changes — the
+`uv pip install` block is unguarded, so it runs every time, and an exact pin
+(`gymnasium==0.29.1`) downgrades an already-installed newer version. What the
+guards protect is only creation: `[ -d "$VENV" ]` skips venv creation, and
+`[ -d "$ROOT/ManiSkill" ]` skips the clone — so **rerunning never updates the
+ManiSkill checkout**. To move that, `git pull` it by hand.
+
+But for a one-package change, rerunning means an `apt-get update`, a torch
+re-resolve and a full Vulkan gate for no reason. Prefer the targeted install:
+
+```bash
+source /workspace/ripl/env.sh
+uv pip install --python /workspace/ripl/venv/bin/python "gymnasium==0.29.1"
+python -c "import gymnasium; print(gymnasium.__version__)"
+bash smoke_test.sh          # gate 5 is the one that proves it
+```
+
+Rerun the whole script when the *machine* changed (new pod, new container), not
+when one dependency did.
+
+Note the unpinned `torch torchvision` line: `uv pip install` without
+`--upgrade` treats an already-satisfied requirement as a no-op, so a rerun does
+not silently move torch. Do not add `--upgrade` to it — the GPU/torch pairing
+is load-bearing and Blackwell cards already have an open ManiSkill issue.
 
 ---
 
@@ -232,6 +450,33 @@ changed once; changing it again should cost one export, not a rename.
 
 ## Known traps
 
+- **`ConnectionResetError: [Errno 104] Connection reset by peer` from an
+  `AsyncVectorEnv` is a dead worker, not a network problem.** The most likely
+  cause in this repo is running the parent from a heredoc: `multiprocessing`'s
+  `forkserver` (and `spawn`) re-import `__main__` in every child, so `__main__`
+  must be importable from a real path. Under `python - <<'PY'` it is not, the
+  child dies during the handshake, and the parent reports a reset socket —
+  which reads like a pod fault and is not one. Anything touching
+  `AsyncVectorEnv` must be **written to a file and run**, with the work under
+  `if __name__ == '__main__':` and imports at module level so the child's
+  re-import restores `sys.path`. `train.py` is a real file, which is why it is
+  unaffected; smoke gate 5 writes itself to `$RIPL_ROOT/smoke/gate5_eval.py`.
+- **`KeyError: 'final_info'` at the first eval means gymnasium ≥ 1.0.** This
+  bit us for real. Gymnasium 1.0 removed `final_info`/`final_observation` from
+  vector envs and switched autoreset to `NEXT_STEP`. `ManiSkillVectorEnv`
+  synthesises `final_info` itself (`vector/wrappers/gymnasium.py:167`) so
+  `physx_cuda` is immune — but the CPU path uses stock
+  `gym.vector.AsyncVectorEnv`, and every baseline's `evaluate()` reads
+  `info["final_info"]` with no guard. So the bug is invisible on GPU and fatal
+  on CPU, which is the backend this pipeline uses throughout. ManiSkill declares
+  `gymnasium>=0.29.1` with no upper bound and branches on `IS_GYMNASIUM_1`, so
+  0.29.1 is supported, not a downgrade hack. `setup_runpod.sh` pins it; smoke
+  gate 5 catches it in seconds by running the real `evaluate()`.
+- **`physx_cpu` raises `RuntimeError` for `num_envs > 1`.** It vectorises by
+  subprocess, not by batching, so any `gym.make(..., num_envs=N,
+  sim_backend='physx_cpu')` with N>1 dies immediately. Use
+  `gym.vector.AsyncVectorEnv` (or the baseline's `make_eval_envs`, which does).
+  Every habit carried over from the `physx_cuda` era violates this.
 - **`train.py`'s flag names move between ManiSkill releases.** Re-check
   `--help` rather than trusting any doc, including this one.
 - **`--capture-video` defaults to True.** Pass `--no-capture-video` for anything
@@ -259,8 +504,11 @@ changed once; changing it again should cost one export, not a rename.
 - **Nothing has been run on StackCube.** No demos, no datasets, no policy, no
   measurements. Every number in this repo is from PushT and belongs only to the
   detour note.
-- The four open questions above are the first thing to resolve on the pod.
-- Then: `bash smoke_test.sh` (gates 1, 2, 4 pass without a dataset; 3 skips),
+- Hyperparameters, demo availability and the initial-state distribution are all
+  now verified from source (see above) rather than open. A shallow ManiSkill
+  checkout lives at `~/ripl/ManiSkill` on the laptop for exactly this — read
+  source locally instead of burning pod time on it.
+- Next: `bash smoke_test.sh` (gates 1, 2, 4, 5 pass without a dataset; 3 skips),
   `bash run_pipeline.sh data`, `bash smoke_test.sh` again for gate 3, then the
   state training run.
 
