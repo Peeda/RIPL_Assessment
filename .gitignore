@@ -80,3 +80,8 @@ vulkaninfo.txt
 ENVIRONMENT.txt
 smoke/
 nohup.out
+
+# --- generated environment ----------------------------------------------------
+# setup_runpod.sh writes env.sh to $RIPL_ROOT, outside this repo, so this is
+# belt-and-braces against a copy landing here. CLAUDE.md claims it is covered.
+env.sh

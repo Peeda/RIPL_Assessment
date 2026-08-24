@@ -79,7 +79,7 @@ PUSH (laptop -> fresh pod, after setup_runpod.sh)
   $R ~/ripl/runs/  root@$IP:$RUNS/
 
   Then verify - a completed rsync is not a complete dataset:
-    bash check_datasets.sh
+    bash smoke_test.sh
 
 DRY RUN anything you are unsure about by adding -n.
 EOF
