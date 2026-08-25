@@ -37,10 +37,11 @@ events.out.tfevents.*
 *.webm
 videos/
 
-# Figures for the report ARE worth committing - they're small, they're
-# deliverables, and you want them versioned alongside the code that made them.
-!figures/**/*.png
-!figures/**/*.pdf
+# figures/ (analyze_rollouts.py's output) IS committed - the plots are small,
+# they are report deliverables, and they want versioning alongside the code that
+# made them. No rule is needed: nothing above ignores *.png or *.pdf, so they
+# are tracked by omission. Said here because silence about a committed artifact
+# type reads like an oversight - the same reason the T-II block below exists.
 
 # --- secrets -----------------------------------------------------------------
 # LLM API keys for T-III, wandb key, R2/S3 credentials.
@@ -85,3 +86,23 @@ nohup.out
 # setup_runpod.sh writes env.sh to $RIPL_ROOT, outside this repo, so this is
 # belt-and-braces against a copy landing here. CLAUDE.md claims it is covered.
 env.sh
+
+# T-II rollout data, committed deliberately.
+#
+# The mined CSVs are a few MB and are the evidence base for the failure-mode
+# characterisation, so they belong in the repo. *.csv is not matched by
+# anything above, so they are already tracked - no rule needed, but say so
+# here, because silence about the one data type this project DOES commit reads
+# like an oversight.
+#
+# The .npz sidecars (per-episode traces, initial/terminal sim states) are
+# caught by the blanket *.npz on line 9, so they need an explicit exception.
+# They are what make the analysis reproducible from the repo alone, without a
+# working ManiSkill install. Tens of MB, which is the ceiling for this - if a
+# trace pass ever gets much bigger than that, keep it on the pod and pull it
+# instead, per CLAUDE.md's rule that nothing large goes into git.
+!*_states.npz
+!*_trace.npz
+
+# mp4s stay ignored (*.mp4 above). Reference them from the report; they are
+# regenerable from a seed with record_seeds.py.

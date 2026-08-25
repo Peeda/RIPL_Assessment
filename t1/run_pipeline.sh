@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# run_pipeline.sh - StackCube-v1 data + diffusion policy training, end to end.
+# t1/run_pipeline.sh - StackCube-v1 data + diffusion policy training, end to end.
 #
 #   source /workspace/ripl/env.sh
 #   tmux new -s ripl
-#   bash run_pipeline.sh data 2>&1 | tee ~/data.log
+#   bash t1/run_pipeline.sh data 2>&1 | tee ~/data.log
 #
 # Stages:  data | train | train-rgb | all   (default: all)
 #
@@ -129,7 +129,7 @@ do_train_rgb() {
   # before reporting upstream's number again. Fail here instead.
   if ! grep -q 'pool_feature_map: bool' "$DP_DIR/train_rgbd.py"; then
     echo "!! $DP_DIR/train_rgbd.py is stock upstream."
-    echo "   Run 'bash apply_patches.sh' first."
+    echo "   Run 'bash setup/apply_patches.sh' first."
     exit 1
   fi
 
@@ -150,7 +150,7 @@ do_train_rgb() {
   if [ -n "$(ls -A "$RUN_DIR/checkpoints" 2>/dev/null)" ]; then
     echo "!! $RUN_DIR/checkpoints already has weights."
     echo "   Training would overwrite them. Pull them off the pod first"
-    echo "   (bash transfer.sh info), then move the directory aside."
+    echo "   (bash setup/transfer.sh info), then move the directory aside."
     echo "   Set FORCE_OVERWRITE=1 to proceed anyway."
     [ "${FORCE_OVERWRITE:-0}" = 1 ] || exit 1
     echo "   FORCE_OVERWRITE=1 set - proceeding."

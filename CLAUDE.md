@@ -25,7 +25,9 @@ RIPL Lab assignment. Four tasks, each depending on the last:
 The report is a running document, not a final step. Hyperparameters, VRAM
 figures, wall-clock times and dead ends get pasted in as they happen. Debugging
 narratives are explicitly requested by the assignment — they are deliverables,
-not overhead. `notes/pusht-detour.md` is the first of them.
+not overhead. `notes/pusht-detour.md` is the first of them;
+`notes/rgb-localisation.md` is the second and covers the T-I RGB arc;
+`notes/t2-failure-modes.md` is the third and holds the T-II results.
 
 **The task changed once already.** This repo was built against `PushT-v1` and
 moved to `StackCube-v1` after the pipeline went green without ever producing a
@@ -47,6 +49,7 @@ numbers into a StackCube table.
 | T-IV residual | 3 translation dims only; gripper passes through | See below. |
 | gymnasium | **`==0.29.1`, pinned below 1.0** | 1.0 removed `final_info` from vector envs. The CPU baseline eval path reads it unconditionally, so `physx_cpu` + gymnasium≥1.0 = `KeyError` at the first eval. See traps. |
 | Failure filtering | never `--allow-failure` | Training IL on failed demonstrations is worse than training on fewer. |
+| Eval seed floor | **every eval block ≥ seed 1000** | Demo seeds start at 0 and run consecutively, so low seeds are the training set. See traps. |
 | Demos / steps / iters | 100 / 200 / **30k state, 100k rgb** | From `baselines.sh`. The two runs do NOT share `total_iters`. `--num-demos` is the one of these that is a free lever — see below. |
 
 ### The replay flag reverses — read this before "fixing" it back
@@ -62,6 +65,22 @@ has to simulate forward. Stated properly:
 
 > Use `--use-env-states` when replay only attaches observations.
 > Use `--use-first-env-state` when replay converts the controller.
+
+### The gripper's ORIENTATION is frozen for the whole episode
+
+`pd_ee_delta_pos` pads the action with three zeros and `compute_target_pose`
+"keeps the current rotation" (`pd_ee_pose.py:86-99`), so the end effector's
+orientation is whatever it was at reset, for all 200 steps. The policy cannot
+rotate the wrist.
+
+Cube yaw is uniform on [0, 2π) (`random_quaternions(bounds=(0, 2*pi), lock_x,
+lock_y)`), so the gripper meets cubes at every misalignment with equal
+probability, and a 40 mm cube gripped near 45 deg presents 40*sqrt(2) = 56.6 mm.
+
+**This is why `separation` is the wrong T-II axis and `face_gap` is the right
+one** - see the T-II section below. It is also a report sentence in its own
+right: the task hands the policy a fixed approach angle and a uniformly random
+cube yaw, so part of the failure rate is structural.
 
 ### The T-IV residual must not touch the gripper dimension
 
@@ -235,7 +254,7 @@ Because the schedule is tied to `total_iters`:
   different LR trajectory.
 - **The state and rgb runs are on deliberately different schedules.** That comes
   from `baselines.sh`; it is a second reason those two numbers stay separate
-  variables in `run_pipeline.sh`.
+  variables in `t1/run_pipeline.sh`.
 
 The PushT-era instinct "set iters high, watch, stop when flat" is therefore
 **wrong here**. If a run is too long, shorten `total_iters` and rerun from
@@ -369,6 +388,10 @@ Do not spend another 100k-iter run on a data or budget lever.
 
 ## The RGB encoder throws away position — `patches/0001`
 
+*Narrative version, with the two hypotheses that were wrong first:*
+`notes/rgb-localisation.md`. This section stays the canonical record of the
+numbers; the note tells the story around them. Do not maintain both.
+
 **This is the reason the visual policy plateaus.** It is a property of
 ManiSkill's baseline, not of anything this repo did.
 
@@ -445,10 +468,21 @@ Per episode, log:
   Two "failure modes" that differ in which flag is false are genuinely different
   modes, and that distinction is most of what T-II is being graded on.
 
-`separation` and `relative_yaw` are the hypothesised failure axes: too close and
-the grasp approach on A collides with B; too far and the place phase runs out of
-steps. Success-rate-versus-separation is the curve T-II is looking for, and the
-prior from the sampler (above) says ~9% of nominal episodes land under 80 mm.
+`separation` and `relative_yaw` were the *hypothesised* failure axes, and both
+have since been superseded by measurement — see Current state. Keep logging them
+(they are pinned columns and the report shows the before/after), but regress
+against the derived features in `t2_common.geom_features`:
+
+- **`face_gap`** = `separation − extentA(bearing) − extentB(bearing)`, the
+  clearance between cube *faces*. Both yaws enter, through the A→B bearing. This
+  is why `relative_yaw` alone measures nothing: yaw is not a scalar you can
+  regress against without a direction to resolve it along.
+- **`dist_A` / `dist_B` / `dist_max` / `dist_min`** from `PANDA_BASE_XY`, not the
+  world origin. Success against `dist_max` is an inverted U, so **bin both
+  tails**; fitting a trend hides half the effect.
+
+These are derived, not logged, so every CSV mined before they existed gains them
+at analysis time via `geom_from_row`. Nothing needs re-mining.
 
 **Log full initial states + success flags for every rollout, always** — including
 diagnostic runs. T-II is near-impossible to do well retroactively without this.
@@ -468,7 +502,7 @@ RunPod, **no network volume, no object storage**. Every pod is a clean rebuild.
 
 - Files move by `rsync` over **direct TCP SSH**, requiring a public IP with
   exposed port 22. The `ssh.runpod.io` proxy cannot do SCP/SFTP/rsync and the
-  error doesn't say so. Run `bash transfer.sh check` first thing on every pod.
+  error doesn't say so. Run `bash setup/transfer.sh check` first thing on every pod.
 - **Stop ≠ Terminate.** A stopped pod's disk survives and is reachable by
   restarting with zero GPUs. A terminated pod is gone. Never terminate a pod you
   haven't pulled from. Running out of credit auto-stops a pod; drained accounts
@@ -501,28 +535,90 @@ On the laptop, for reading source without a pod:
 ~/ripl/demos        rsync target for pulled datasets
 ```
 
+Inside this repo, one directory per assignment task (see The scripts, below):
+
+```
+setup/    pod build, patching, transfer, smoke gates
+t1/       run_pipeline.sh - data replay + both training runs
+t2/       run_t2.sh and the mining/analysis harness
+patches/  patches applied to the ManiSkill checkout
+notes/    debugging narratives; report material, not overhead
+figures/  analyze_rollouts.py's output, committed
+```
+
 ---
 
 ## The scripts
 
-Four files, each with one job:
+**One directory per assignment task**, plus `setup/` for everything that is
+task-independent. `t3/` and `t4/` will sit alongside `t1/` and `t2/`; the
+numbering means the same thing in all four.
+
+### `setup/` — pod infrastructure, no task attached
 
 | | |
 |---|---|
 | `setup_runpod.sh` | Builds a fresh pod: packages, Vulkan/EGL ICDs, venv, ManiSkill clone. Writes `env.sh`. Deliberately checks nothing at runtime. |
-| `smoke_test.sh` | Five gates, ~3 min. Sim constructs; renderer emits real pixels; dataset action dim matches; seeds determine initial states; the real evaluate() runs. Gate 4 is T-II's prerequisite. |
-| `run_pipeline.sh` | The recipe, plus one deviation (`POOL_FEATURE_MAP`). `data` \| `train` \| `train-rgb` \| `all`. |
 | `apply_patches.sh` | Applies `patches/*.patch` to the ManiSkill checkout. `apply` \| `status` \| `revert`. Idempotent. Run after every `setup_runpod.sh`. |
+| `smoke_test.sh` | Five gates, ~3 min. Sim constructs; renderer emits real pixels; dataset action dim matches; seeds determine initial states; the real evaluate() runs. Gate 4 is T-II's prerequisite. |
 | `transfer.sh` | `check` \| `info` \| `send`. Run `check` before anything else on a new pod. |
 
-`ENV_ID` is a variable in both `run_pipeline.sh` and `smoke_test.sh`. The task has
-changed once; changing it again should cost one export, not a rename.
+### `t1/` — data and training
+
+| | |
+|---|---|
+| `run_pipeline.sh` | The recipe, plus one deviation (`POOL_FEATURE_MAP`). `data` \| `train` \| `train-rgb` \| `all`. |
+
+Thin on purpose. It is one command because StackCube ships one raw
+`trajectory.h5`; the T-I *numbers* come out of `t2/`, see below.
+
+### `t2/` — the failure-mode harness
+
+| | |
+|---|---|
+| `run_t2.sh` | Driver. `index` \| `t1` \| `mine` \| `region` \| `backend` \| `videos` \| `analyze` \| `plan` \| `all`. |
+| `run_all.sh` | **Everything T-II still needs, in order.** `preflight` \| `index` \| `size` \| `modes` \| `feasible` \| `backend` \| `analyze` \| `verify` \| `all`. Derives `CKPT`; resumable. |
+| `run_modes.sh` | The three pre-registered per-mode evaluations. `size` \| `gap` \| `farb` \| `nearbase` \| `analyze` \| `all`. |
+| `verify.py` | Asserts a finished pass is what it claims. No sim. Exits non-zero, so it can gate a report. |
+| `t2_common.py` | Angle conventions, cube + **geometry** features, Wilson, checkpoint loading, manifests. |
+| `seed_index.py` | seed → initial state, **policy-free**. No GPU, minutes. |
+| `select_seeds.py` | Pick seeds by any condition on the initial state. `--dry-run` sizes a pass. |
+| `mine_rollouts.py` | The overnight miner. Parallel, resumable, fully logged. |
+| `record_seeds.py` | mp4s for named seeds, retried until the outcome matches. |
+| `analyze_rollouts.py` | Curves, taxonomy, Wilson intervals, video shortlist. |
+| `rollout_log.py` | The localisation probe. `num_envs=1`; produced the reach-error numbers. |
+| `backend_check.py` | Does `physx_cuda` reproduce `physx_cpu`? Paired by injected initial state, not by seed. |
+| `reach_map.py` | Reachable set for the frozen top-down gripper. **Policy-free**, needs ManiSkill. |
+| `demo_feasibility.py` | The motion planner as a feasibility oracle. A metadata join; no sim needed. |
+
+Three placement calls, so they are not re-litigated:
+
+- **`t2_common.py` imports gymnasium and torch *optionally*.** `analyze_rollouts.py`,
+  `select_seeds.py` and `demo_feasibility.py` are pure-CSV tools and must run on
+  a laptop with no ManiSkill install — which is the same reason the saved state
+  arrays carry their own column names. Only the rollout half needs the sim, and
+  only it fails without one.
+
+- **`rollout_log.py` lives in `t2/` even though its reach-error numbers are T-I
+  material.** It does `import t2_common`, and python only puts a script's *own*
+  directory on `sys.path` — from `t1/` that import breaks. It is a rollout
+  harness sharing the T-II conventions module, so it lives with them.
+- **`run_t2.sh t1` is a T-I deliverable produced by the T-II harness**, and that
+  is deliberate rather than a filing mistake. T-I's error bars cannot come from
+  the training logs (see above), so the standalone harness is what produces
+  them. One tool, two deliverables.
+
+`ENV_ID` is a variable in both `t1/run_pipeline.sh` and `setup/smoke_test.sh`.
+The task has changed once; changing it again should cost one export, not a
+rename.
+
+`figures/` at the repo root is `analyze_rollouts.py`'s output and is committed.
 
 ---
 
 ## Changing the pod's python environment
 
-`setup_runpod.sh` is **safe to rerun** and does apply dependency changes — the
+`setup/setup_runpod.sh` is **safe to rerun** and does apply dependency changes — the
 `uv pip install` block is unguarded, so it runs every time, and an exact pin
 (`gymnasium==0.29.1`) downgrades an already-installed newer version. What the
 guards protect is only creation: `[ -d "$VENV" ]` skips venv creation, and
@@ -536,7 +632,7 @@ re-resolve and a full Vulkan gate for no reason. Prefer the targeted install:
 source /workspace/ripl/env.sh
 uv pip install --python /workspace/ripl/venv/bin/python "gymnasium==0.29.1"
 python -c "import gymnasium; print(gymnasium.__version__)"
-bash smoke_test.sh          # gate 5 is the one that proves it
+bash setup/smoke_test.sh    # gate 5 is the one that proves it
 ```
 
 Rerun the whole script when the *machine* changed (new pod, new container), not
@@ -576,7 +672,7 @@ is load-bearing and Blackwell cards already have an open ManiSkill issue.
 - `--track` (wandb) from the first real training run. It captures loss curves,
   `torch.cuda.max_memory_allocated()` and step timings off-pod automatically —
   all T-I and T-IV deliverables. Requires `wandb login` first or it fails at
-  startup; `run_pipeline.sh` checks.
+  startup; `t1/run_pipeline.sh` checks.
 - At high `--num_eval_envs` the logged scalar is a single mean over the batch, so
   per-eval variance is not recoverable from wandb. **T-I error bars must come
   from a standalone harness, not the training logs.**
@@ -605,13 +701,27 @@ is load-bearing and Blackwell cards already have an open ManiSkill issue.
   `info["final_info"]` with no guard. So the bug is invisible on GPU and fatal
   on CPU, which is the backend this pipeline uses throughout. ManiSkill declares
   `gymnasium>=0.29.1` with no upper bound and branches on `IS_GYMNASIUM_1`, so
-  0.29.1 is supported, not a downgrade hack. `setup_runpod.sh` pins it; smoke
+  0.29.1 is supported, not a downgrade hack. `setup/setup_runpod.sh` pins it; smoke
   gate 5 catches it in seconds by running the real `evaluate()`.
 - **`physx_cpu` raises `RuntimeError` for `num_envs > 1`.** It vectorises by
   subprocess, not by batching, so any `gym.make(..., num_envs=N,
   sim_backend='physx_cpu')` with N>1 dies immediately. Use
   `gym.vector.AsyncVectorEnv` (or the baseline's `make_eval_envs`, which does).
   Every habit carried over from the `physx_cuda` era violates this.
+- **A seed does not address an episode on `physx_cuda`, and the assert that
+  should catch that PASSES AND LIES.** `_initialize_episode` draws cube poses
+  with `torch.rand` under `with torch.device(self.device)`
+  (`stack_cube.py:78-100`), so the CUDA generator gives different states than
+  the CPU one for the same seed. Worse, `reset()` seeds the whole batch from
+  `self._episode_seed[0]` (`sapien_env.py:950-953`) while `_initialize_episode`
+  draws `(b, 2)` at once - so at width > 1 every env's state derives from env
+  0's seed and depends on the batch width. `mine_rollouts.py` asserts the
+  episode seed came back as requested; `_episode_seed` IS recorded per-env, so
+  the assert passes while the states it is supposed to guarantee are not the
+  ones asked for. **The seed index and every T-II seed list are `physx_cpu`
+  artifacts.** Do not port them. `t2/backend_check.py` compares the backends by
+  replaying exact initial states instead, which is what licenses T-IV training
+  on GPU and evaluating on CPU.
 - **`train.py`'s flag names move between ManiSkill releases.** Re-check
   `--help` rather than trusting any doc, including this one.
 - **`--capture-video` defaults to True.** Pass `--no-capture-video` for anything
@@ -627,6 +737,16 @@ is load-bearing and Blackwell cards already have an open ManiSkill issue.
 - **Motionplanning demos are planner output, not human teleop.** Close to
   unimodal per initial condition, which mutes diffusion policy's usual edge over
   plain BC. Belongs in the T-I discussion.
+- **Demo episode seeds start at 0 and run consecutively, so low seeds are the
+  TRAINING SET.** `examples/motionplanning/panda/run.py:44-101` does
+  `seed = start_seed` (0), `solve(env, seed=seed)`, `seed += 1` per attempt.
+  ~990 trajectories were replayed and 800 trained on, so roughly **seeds
+  [0, 1000) are training initial states**. Evaluating there measures
+  memorisation. Measured on the same checkpoint: **0.910 on seeds 0-299 vs
+  0.713 on held-out seeds 1000-2199**, with the gap uniform across every
+  separation bin, flat over the run and flat across workers. `t2/run_t2.sh`
+  now refuses `T1_BASE < DEMO_SEED_CEILING`. This bit us for real — the first
+  production T-I pass ran on seeds 0-299.
 
 ---
 
@@ -641,27 +761,174 @@ is load-bearing and Blackwell cards already have an open ManiSkill issue.
   at 100 demos, **~0.43** at 800 demos — both on upstream's pooled encoder.
 - **Diagnosed:** the RGB plateau is the encoder's global max-pool discarding
   spatial layout, not data volume and not training budget. See the two sections
-  above. `patches/0001` turns it off; `run_pipeline.sh` defaults to the spatial
+  above. `patches/0001` turns it off; `t1/run_pipeline.sh` defaults to the spatial
   encoder and records the variant in the run name.
 - Hyperparameters, demo availability and the initial-state distribution are all
   verified from source. A shallow ManiSkill checkout lives at `~/ripl/ManiSkill`
   on the laptop for exactly this — read source locally instead of burning pod
-  time on it. Keep it **stock**: `apply_patches.sh revert` after any local test,
+  time on it. Keep it **stock**: `bash setup/apply_patches.sh revert` after any local test,
   or local source-reading stops matching upstream.
+- **The spatial-encoder RGB checkpoint exists** (800 demos, 100k schedule,
+  `patches/0001`). It is the T-I deliverable and T-IV's frozen base. The full
+  arc that produced it — the wrong "it's blind" diagnosis, the data lever and
+  where it ran out, the encoder finding — is written up in
+  `notes/rgb-localisation.md`.
+- **The production T-II pass has run**, and its axes have since been corrected.
+  1,900 episodes, RTX 4090, 55 min at ~2,000 ep/h. Full write-up in
+  `notes/t2-failure-modes.md`. Headlines:
+  - **T-I = 0.737**, SD 0.078 over 3 × 100 on held-out seeds 6000–6299; 0.713
+    [0.687, 0.738] on the 1,200-episode nominal pass. The 0.910 from the first
+    `t1` pass was measured on seeds 0–299, which are *training* initial states —
+    see the demo-seed trap. That gap is a memorisation result, not a T-I number.
+  - **`separation` is the wrong axis, and both original modes are restated on
+    better ones.** Measured on the same 1,200 held-out episodes, no new data:
+    - **`face_gap`** — the clearance between cube *faces* along the A→B bearing,
+      so both yaws enter. 0.500 at 5–20 mm rising to 0.794 at 70–120 mm, and it
+      survives controlling for separation (within sep < 100 mm: 0.524 low-gap vs
+      0.670 high-gap). Mechanism in the source: the gripper's orientation is
+      frozen at reset, so the policy cannot square up to a misaligned cube.
+    - **`dist_max` / `dist_min` from `PANDA_BASE_XY`** — an inverted U. 0.467
+      below 520 mm, 0.774 mid-band, 0.508 above 760 mm. The old "separation >
+      260 mm" mode is largely this one seen through a correlated variable; the
+      2×2 puts the separation tail at −0.084, the reach tail at −0.198, both at
+      −0.356.
+  - **The reach band's two ends fail by different mechanisms**, which is what
+    makes them separate modes. Far cubeA spikes `never grasped` to 0.149 against
+    a 0.016 base rate; far cubeB leaves it at 0.015 and fails at placement;
+    near-base grasps normally and fails at placement at 0.178 vs 0.069.
+  - **Toppling is not a third mode.** It is 28.7% of placements, but no
+    initial-state feature predicts it. What does is `cubeB_displacement` (hold
+    rate 0.919 → 0.032), an outcome — so it is the face-gap mode's downstream
+    consequence. This closes a question `CLAUDE.md` previously left open.
+  - **T-IV carries two targets** — `face_gap < 25 mm` and far-cubeB-with-cubeA-
+    comfortable — chosen because they fail at *different stages* by *different*
+    mechanisms. See the decision point below; an earlier claim that the reach
+    mode was not residual-fixable has been retracted there.
+  - **Beware `far_is_B` as a mechanism split.** The `never_grasped = 0.149` for
+    "far cube = A" mixes in both-cubes-far episodes. Isolating cubeA ≥ 760 mm
+    with cubeB < 720 mm gives 0.083, and the grasp failures actually concentrate
+    in the both-far corner (0.815 above 740 mm). Condition on the *other* cube
+    when attributing a mechanism to one of them.
+  - The gate holds comfortably: 0.713 is well below 1, and the nominal pass
+    yields 344 failures rather than the ~13 that 0.87 would have given.
 - **Next, in order:**
-  1. `bash apply_patches.sh` on the pod (after `setup_runpod.sh`, which
+  1. `bash setup/apply_patches.sh` on the pod (after `setup_runpod.sh`, which
      re-clones ManiSkill and wipes the patch).
-  2. `rollout_log.py` on the *existing* 800-demo pooled checkpoint. Two numbers
-     decide what the encoder change has to beat: **reach error** (still ~86 mm →
-     localisation is confirmed binding) and **`success_at_end` vs
-     `success_once`** (a large gap is unstable placement, a distinct T-II mode;
-     a small gap with low `success_once` is timeouts against
-     `max_episode_steps 200`). Do this before the retrain — it is minutes, and
-     it is the A/B's baseline row.
-  3. `NUM_DEMOS=800 bash run_pipeline.sh train-rgb` — spatial encoder, same
-     100k schedule, so the only changed variable is the encoder.
-  4. Re-run `rollout_log.py` on the new checkpoint and put the two rows side by
-     side.
+  2. `bash t2/run_all.sh` — everything below in one command, resumable, ~1 h.
+     The stages are listed separately here because they can be run piecemeal.
+  3. `python t2/demo_feasibility.py $MS_ASSET_DIR/demos/StackCube-v1/motionplanning/trajectory.json`
+     and `python t2/reach_map.py` — do the far-reach failures belong to the
+     policy or to the task? Both are cheap; the first is a metadata join.
+  4. `bash t2/run_t2.sh backend` — needs a GPU. Licenses T-IV's train-on-GPU,
+     evaluate-on-CPU split. Not part of `all`.
+  5. `bash t2/run_t2.sh analyze`, then `videos` on the shortlist it prints —
+     preferably seeded from the region lists so each clip illustrates a mode.
+  6. Pull before stopping the pod: `bash setup/transfer.sh info`. Figures do
+     **not** come back by git; the pod never pushes.
+
+---
+
+## The T-II harness
+
+`bash t2/run_t2.sh <stage>` — the file-by-file map is in The scripts, above.
+Read this section before adding a stage.
+
+The rollout stages use **disjoint seed blocks**: `t1` takes [0, 300) as three
+blocks of 100 with three policy seeds, `mine` takes [1000, 1000+NOMINAL), and
+`region` draws only from seeds above that. Disjointness is not tidiness — a T-I
+number that shares episodes with the T-II substrate is not an independent check
+on it, and re-measuring a region on the rollouts that found it measures noise.
+
+`rollout_log.py` stays what it is: the **localisation probe**, `num_envs=1`, the
+thing that produced the reach-error numbers above. It shares `t2_common.py` with
+the miner so the two cannot disagree on the wrap convention or on which weights
+get loaded.
+
+### The seed index is the load-bearing idea
+
+`reset(seed=s)` is deterministic (`sapien_env.py:950-953`), so **a seed is a
+lossless 8-byte encoding of the whole 70-float initial state.** Tabulating
+seed → cube poses needs resets only — no policy, no 200-step rollout, no GPU.
+
+That turns T-II's "resample *fresh* episodes from the failure region" into
+rejection sampling over integers: filter the index for `separation < 0.080`,
+hand the surviving seeds to the miner. The episodes that come back are drawn
+from exactly the env's own conditional distribution given the region. No state
+injection, no distribution shift, every episode reproducible from one integer.
+
+It also means **no exploratory question about initial states can be foreclosed
+by a logging decision.** Anything not logged is a reset away from being
+recovered.
+
+The alternative — injecting poses via `options={"reset_to_env_states": ...}` —
+replaces `_initialize_episode` wholesale (robot qpos and table pose would have
+to be synthesised too) and broadcasts identically to every worker under
+`AsyncVectorEnv`. Save it for T-III, where a biased distribution is the goal.
+
+### What gets logged, and why that split
+
+**Initial state: the seed suffices, but log it anyway.** Redundant by
+construction, ~1.7 MB, and it makes the dataset self-contained — the analysis
+reproduces from committed files without a ManiSkill install. It also carries
+the one part of the initial state the cube columns ignore: the Panda's
+randomised initial qpos (`robot_init_qpos_noise=0.02`), so "arm configuration
+doesn't matter" becomes testable rather than assumed.
+
+**Terminal and trajectory state: log it, because it cannot be regenerated.**
+The rollout is stochastic — that episode happened once, and re-running the seed
+produces a different one. Hence the terminal state dict and a stride-5 trace
+(cubeA/cubeB/tcp xyz + the 4 flags) for every episode, stride-1 for the region
+pass. This is what separates *locating* a failure region from *explaining* one:
+`success_once` says an episode failed, the trace says whether cubeB was
+displaced during the approach or during the placement, and those are two
+different modes.
+
+Not doing `RecordEpisode(save_trajectory=True)` during mining: `make_eval_envs`
+attaches it to sub-env 0 only (`make_env.py:52`), so capturing all workers means
+forking the thunk and giving up the bit-identical-to-training eval path that
+makes these numbers comparable to T-I.
+
+### Two conventions that differ from a naive reading
+
+- **`relative_yaw_mod90`.** A cube has 4-fold yaw symmetry, so `+85°` and `−5°`
+  are the *same* geometry. CLAUDE.md's pinned `(−π, π]` column is logged exactly
+  as specified, but it is the wrong axis to regress against — it splits one
+  physical configuration across two ends of the range. Analysis uses the mod-90
+  column. Both are logged.
+- **`face_gap` can go negative**, and that is meaningful rather than a bug: it
+  means the two cubes' bounding squares overlap along the bearing between them,
+  which the sampler's 58.6 mm centre-separation floor does not exclude for
+  diagonally-presented cubes. Do not clamp it.
+- **Wilson, not `sqrt(p(1−p)/n)`.** At n≈100 the interesting bins sit near
+  p = 0, where the normal interval runs below zero and claims certainty it does
+  not have — a 0/20 bin gets ±0.000 from the normal formula and [0, 0.161] from
+  Wilson. Same data, honest bars.
+
+### Pre-registration
+
+The 80 mm threshold comes from the sampler analysis above, **written down before
+any rollout ran**. The three refined thresholds — `face_gap < 25 mm`,
+`dist_min < 520 mm`, `dist_max ≥ 760 mm` — are written down in
+`notes/t2-failure-modes.md` and in `t2/run_modes.sh` before their passes ran,
+along with the nominal-pass success rate each one has to reproduce on fresh
+seeds. Every region pass draws its seeds from above the nominal range so the
+passes are disjoint — re-measuring on the rollouts that found the region
+measures noise.
+
+The three refined filters also **partition on `dist_min` and `dist_max`**, so
+they are mutually exclusive and each controls for the other modes' factor.
+Without that they contaminate each other and none of the numbers means anything.
+
+Say all of this in the report; a threshold fixed in advance is a materially
+stronger claim than one chosen after seeing the scatter.
+
+### A correction to this file
+
+The success criterion above says cubeA must land "within ±5 mm in xy and z".
+Source (`stack_cube.py:118-122`) uses `‖(0.02, 0.02)‖ + 0.005 ≈ 33.3 mm` in xy
+and ±5 mm in z. The xy tolerance is nearly a full cube width, so "stacked but
+visibly offset" scores as success. Worth knowing before calling a marginal
+placement a failure.
 
 **The gate on everything downstream** is a state-obs policy with success
 meaningfully above 0 *and* meaningfully below 1. Above 0 is what PushT never
@@ -673,9 +940,51 @@ The RGB run's checkpoint is the T-I deliverable and the frozen base for T-IV.
 Failure modes must be characterised on the *visual* policy, since that is what
 T-III and T-IV improve.
 
-**Decision point:** commit to full T-IV on **one** failure mode. One mode with
-clean curves, proper 3-seed eval on both distributions, and honest analysis beats
-two half-trained runs. State the choice explicitly in the report.
+**Decision point — decided: the report carries TWO targets, and they are chosen
+to have different mechanisms.**
+
+| | region | fails at | mechanism |
+|---|---|---|---|
+| **A** | `face_gap < 25 mm` | getting cubeA onto cubeB | approach fouls cubeB — displacement median 0.69 mm, 37.7% over 5 mm vs 16.6% reference; but `hold\|place` is normal at 0.809 |
+| **B** | cubeB ≥ 760 mm from base, cubeA comfortable | the stack **staying** | places fine (0.870 given grasp, vs 0.904 reference) and `hold\|place` collapses to **0.657** vs 0.820; cubeB displacement is near-normal |
+
+Two modes that fail at *different stages* by *different mechanisms* is a much
+stronger T-II result than two slices of one curve, and it gives T-IV two
+independent chances to show an effect. Budget for both properly — the original
+warning still stands, that one mode with clean curves and a proper 3-seed eval
+on both distributions beats two half-trained runs. If the budget will only carry
+one, drop **B** and say so; **A** has the better-attested mechanism.
+
+**Both are residual-fixable, and the earlier argument that reach was not has
+been retracted.** The claim was that `a = a_base + clip(Δ, −α, α)` bounds Δ in
+metres so it cannot extend the robot's reach. That is wrong twice:
+
+- α bounds the **per-step** delta, applied over ~200 steps, so a persistent
+  correction accumulates. The binding limit is not α's magnitude but the IK
+  *saturating*, which only happens at the arm's actual kinematic edge.
+- Mode B is not a reach failure at all. Conditioned on cubeA being comfortable,
+  the far-cubeB grasp rate is **1.000** and the place rate is 0.870 — the robot
+  gets there. It fails to make the stack settle, which is precision, which is
+  what a bounded translation residual is for.
+
+Where the original argument *does* hold is the both-cubes-far corner: grasp
+drops to 0.879 above 720 mm and 0.815 above 740 mm (n=27), and no bounded
+residual recovers a target the IK cannot reach. **Exclude that corner from
+mode B's region** rather than letting it depress the result — hence "cubeA
+comfortable" in the definition above, not just "cubeB far".
+
+**The per-failure-mode number has a required shape: 100 rollouts × 3 seeds**,
+same as T-I's. That means three **disjoint blocks of 100 region seeds**, each
+run under its own policy seed — not one block of 100 evaluated three times.
+Reusing one block and varying only the policy seed holds the initial states
+fixed and measures DDPM sampling noise, which is a much smaller quantity than a
+real error bar. `run_t2.sh do_region` does the former; it did the latter until
+this was checked, and got the shape wrong (200 seeds × 2 repeats at one policy
+seed).
+
+The full 300-seed list per mode is also **the targeted-evaluation set** that
+T-III biases toward and T-IV is scored on. `region_<tag>_seeds.csv` is that
+artifact — fix it once and reuse it, or the before/after is not a comparison.
 
 **Never cut:** the T-I baseline number, the quantitative failure
 characterisation, and the nominal-distribution re-evaluation after finetuning.

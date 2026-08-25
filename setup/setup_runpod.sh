@@ -4,12 +4,12 @@
 #
 # Scope: install the machine + graphics + python layers, and verify only that
 #        far. Runtime verification (sim, rendering, data, training) belongs to
-#        smoke_test.sh and is deliberately NOT duplicated here.
+#        setup/smoke_test.sh and is deliberately NOT duplicated here.
 #
 # Assumes: Ubuntu 22.04 container, NVIDIA GPU, /workspace writable, root.
 #
-# Usage:   bash setup_runpod.sh
-# Then:    source /workspace/ripl/env.sh && bash smoke_test.sh
+# Usage:   bash setup/setup_runpod.sh
+# Then:    source /workspace/ripl/env.sh && bash setup/smoke_test.sh
 # ==============================================================================
 set -euo pipefail
 
@@ -244,5 +244,5 @@ echo "Nothing about the simulator, data, or training is verified yet."
 echo ""
 echo "  source $ROOT/env.sh"
 echo "  tmux new -s smoke"
-echo "  bash smoke_test.sh"
+echo "  bash setup/smoke_test.sh"
 echo "=============================================================="

@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# apply_patches.sh - apply this repo's patches to the ManiSkill checkout.
+# setup/apply_patches.sh - apply this repo's patches to the ManiSkill checkout.
 #
 #   source /workspace/ripl/env.sh
-#   bash apply_patches.sh          # apply (idempotent)
-#   bash apply_patches.sh status   # report only, change nothing
-#   bash apply_patches.sh revert   # back to stock upstream
+#   bash setup/apply_patches.sh          # apply (idempotent)
+#   bash setup/apply_patches.sh status   # report only, change nothing
+#   bash setup/apply_patches.sh revert   # back to stock upstream
 #
-# Why this file exists: setup_runpod.sh clones ManiSkill behind a
+# Why this file exists: setup/setup_runpod.sh clones ManiSkill behind a
 # [ -d "$ROOT/ManiSkill" ] guard, so a rerun never updates the checkout, and a
 # fresh pod re-clones it from scratch. Any change we need inside ManiSkill's
 # tree therefore has to live here, in git, as a patch - editing the pod's copy
 # by hand is one rebuild away from gone.
 #
 # Idempotent by construction: a patch that reverse-applies cleanly is already
-# in, and is skipped. Safe to run after every setup_runpod.sh.
+# in, and is skipped. Safe to run after every setup/setup_runpod.sh.
 # ==============================================================================
 set -euo pipefail
 
@@ -24,7 +24,8 @@ ENVSH="${RIPL_ROOT:-/workspace/ripl}/env.sh"
 : "${MANISKILL_REPO:?source /workspace/ripl/env.sh first}"
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-PATCHES=$HERE/patches
+ROOT=$(cd "$HERE/.." && pwd)      # this script lives in setup/; patches/ is at the root
+PATCHES=$ROOT/patches
 MODE=${1:-apply}
 
 shopt -s nullglob

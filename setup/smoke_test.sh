@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# smoke_test.sh - runtime verification. Five gates, ~3 min.
+# setup/smoke_test.sh - runtime verification. Five gates, ~3 min.
 #
-#   source /workspace/ripl/env.sh && bash smoke_test.sh
+#   source /workspace/ripl/env.sh && bash setup/smoke_test.sh
 #
 # Scope: everything setup_runpod.sh deliberately does not check, minus anything
 # run_pipeline.sh already proves by doing it for real. What is left is the five
@@ -139,7 +139,7 @@ gate 3 "datasets: action dim, and RGB frames are not black"
 STATE_H5=$DEMOS/trajectory.state.$CTRL.$BACKEND.h5
 RGB_H5=$DEMOS/trajectory.rgb.$CTRL.$BACKEND.h5
 if [ ! -f "$STATE_H5" ] && [ ! -f "$RGB_H5" ]; then
-  skip "no datasets yet — run 'bash run_pipeline.sh data'"
+  skip "no datasets yet — run 'bash t1/run_pipeline.sh data'"
 elif STATE_H5="$STATE_H5" RGB_H5="$RGB_H5" CTRL="$CTRL" ENV_ID="$ENV_ID" \
      BACKEND="$BACKEND" python - <<'PY'
 import os, h5py, numpy as np, gymnasium as gym, mani_skill.envs
@@ -398,7 +398,7 @@ echo ""
 if printf '%s\n' "${RESULTS[@]}" | grep -q '^FAIL'; then
   exit 1
 fi
-echo "  All green. Next: bash run_pipeline.sh data, then train."
+echo "  All green. Next: bash t1/run_pipeline.sh data, then train."
 echo ""
 echo "  Not checked here: mp4 writing. --capture-video defaults to True, so"
 echo "  the first training run proves it. T-II needs those videos - look at"
