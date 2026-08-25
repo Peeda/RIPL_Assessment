@@ -15,6 +15,9 @@
 #   index    seed -> initial state table. No policy, no GPU, ~5 min.
 #   check    prove the rollouts are driven by THESE weights, by racing them
 #            against untrained / random / zero actions. ~4 min.
+#   smoke    2 episodes through the full rollout path, into $OUT/smoke. ~1 min,
+#            and it is the cheapest way to find out the eval will run at all -
+#            that path cannot be exercised off-pod.
 #   eval     the deliverable: per-mode success over 100 rollouts x 3 seeds,
 #            for both modes plus a nominal reference arm. ~27 min.
 #   verify   assert the pass is what it claims. Exits non-zero if not.
@@ -63,6 +66,24 @@ export STATE_FLAG=${STATE_FLAG:-}
 
 t0=$(date +%s)
 stage() { echo ""; echo "######## $* [$(( $(date +%s) - t0 ))s]"; }
+
+# Under `set -e` a failing stage aborts before the trailing reminder prints -
+# and a failed run is exactly when you most need to be told not to terminate
+# the pod, because the partial rollouts on disk are unreproducible.
+on_exit() {
+  local rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  echo ""
+  echo "######## FAILED at stage '${STAGE:-?}' (exit $rc) after $(( $(date +%s) - t0 ))s"
+  echo ""
+  echo "  Anything already written is in $OUT and is NOT reproducible -"
+  echo "  rollouts are stochastic. Pull before you stop or terminate the pod:"
+  echo "      bash setup/transfer.sh info"
+  echo ""
+  echo "  Re-running the same command resumes: finished blocks are skipped."
+  exit "$rc"
+}
+trap on_exit EXIT
 
 # ---------------------------------------------------------------------------
 # The checkpoint is DERIVED, not pasted. t1/run_pipeline.sh builds the run
@@ -147,6 +168,31 @@ do_eval() {
     --episodes "$EPISODES" --blocks "$BLOCKS" --num-envs "$NUM_ENVS"
 }
 
+# The full eval is 27 minutes and the rollout path cannot be exercised off-pod
+# (no ManiSkill on the laptop) - which is the exact category the seed_index
+# header bug fell into: found by running it, at minute three of a long job.
+# This reaches every line of that path in about a minute.
+#
+# It writes to a SEPARATE directory on purpose. Sharing $OUT would leave
+# 2-episode CSVs behind that the real run's resume logic would happily accept
+# as finished blocks.
+do_smoke() {
+  local sd="$OUT/smoke"
+  [ -f "$OUT/seeds.csv" ] || { echo "!! run 'bash t2/run.sh index' first"; exit 1; }
+  stage "smoke - 2 episodes x 1 block x 1 mode, into $sd"
+  rm -rf "$sd"; mkdir -p "$sd"
+  python "$HERE/eval_modes.py" "$CKPT" $STATE_FLAG \
+    --modes gap --index "$OUT/seeds.csv" --out "$sd" \
+    --episodes 2 --blocks 1 --num-envs 2
+  echo ""
+  echo "  The rollout path works end to end: seeds selected, env reset to them,"
+  echo "  all four per-episode assertions passed, metrics read, CSV written."
+  echo "  (verify.py will reject this shape - it is 1 block of 2, not 3 of 100."
+  echo "   That is the point; it is a smoke test, not a measurement.)"
+  echo ""
+  echo "  Now run the real thing:  bash t2/run.sh eval"
+}
+
 do_verify() { stage "verify"; python3 "$HERE/verify.py" "$OUT"; }
 
 do_report() {
@@ -168,17 +214,22 @@ do_videos() {
     --want "${WANT:-fail}" --attempts "${ATTEMPTS:-5}" --out "$OUT/videos"
 }
 
+STAGE=${1:-all}
 case "${1:-all}" in
   test)    do_test ;;
   index)   do_preflight; do_index ;;
   check)   do_preflight; do_check ;;
+  smoke)   do_preflight; do_smoke ;;
   eval)    do_preflight; do_eval ;;
   verify)  do_verify ;;
   report)  do_report ;;
   videos)  do_preflight; do_videos ;;
-  all)     do_test; do_preflight; do_index; do_check; do_eval
+  all)     do_test; do_preflight; do_index; do_check; do_smoke; do_eval
            do_verify; do_report ;;
-  *) sed -n '2,33p' "$SELF"; exit 1 ;;
+  # trap off first: an unknown stage is a usage error, and telling someone to
+  # rescue data because they mistyped a stage name is how a real warning stops
+  # being read.
+  *) trap - EXIT; sed -n '2,36p' "$SELF"; exit 1 ;;
 esac
 
 stage "done - outputs in $OUT, figures in $ROOT/figures"

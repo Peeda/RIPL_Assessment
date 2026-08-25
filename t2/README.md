@@ -378,9 +378,17 @@ bash t2/run.sh all 2>&1 | tee ~/t2.log
 | `test` | the two self-tests | ~3 s |
 | `index` | seed → initial state, 25,000 seeds | ~5 min, no GPU |
 | `check` | trained weights vs untrained / random / zero | ~4 min |
+| `smoke` | 2 episodes through the whole rollout path | ~1 min |
 | `eval` | **the deliverable** — 900 episodes, 3 modes × 3 × 100 | ~27 min |
 | `verify` | the gate | ~1 s |
 | `report` | tables and figures | ~10 s |
+
+`smoke` exists because the rollout path is the one part of this harness that
+**cannot be exercised off-pod** — there is no ManiSkill on a laptop. That is
+exactly the category the one real crash in the old harness fell into (a stale
+hardcoded CSV header, found at minute three of a long job). It writes to
+`$OUT/smoke`, deliberately separate, so its 2-episode CSVs cannot be mistaken
+for finished blocks by the resume logic.
 
 Resumable: every stage skips work already done, and `eval` never overwrites a
 finished block, because rollouts are stochastic and anything clobbered is gone.

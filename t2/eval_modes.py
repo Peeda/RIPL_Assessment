@@ -353,6 +353,20 @@ def main():
             # anything clobbered here is gone for good.
             if os.path.exists(prefix + ".csv") and os.environ.get("FORCE") != "1":
                 rows = list(csv.DictReader(open(prefix + ".csv")))
+                # A SHORT block is a crashed block, not a finished one, and
+                # resuming past it would silently report a rate over the wrong
+                # sample size. The likeliest way to get one is a smoke run or an
+                # interrupted job writing into this directory - both plausible,
+                # neither something to paper over.
+                if len(rows) != a.episodes:
+                    sys.exit(
+                        f"\n!! {prefix}.csv has {len(rows)} episodes, expected "
+                        f"{a.episodes}.\n"
+                        f"   That is an interrupted or differently-sized run, not "
+                        f"a finished block.\n"
+                        f"   Delete it and re-run, or set FORCE=1 to overwrite it "
+                        f"(the existing\n"
+                        f"   rollouts are stochastic and will not come back).\n")
                 for r in rows:
                     for k in ("success_once", "ever_grasped", "ever_placed",
                               "ever_static"):
