@@ -425,8 +425,9 @@ kept), rather than flipping the constant, so both arms stay runnable and the
 value reaches wandb's config through `vars(args)` (`train_rgbd.py:453`).
 
 - **Checkpoints are not interchangeable across this flag.** `visual_encoder.fc.0.weight`
-  is `(256, 128)` pooled and `(256, 8192)` spatial. `rollout_log.py` infers which
-  from the weights and configures `Args` to match — do not add a manual flag for it.
+  is `(256, 128)` pooled and `(256, 8192)` spatial. `harness.inspect_ckpt` infers
+  which from the weights and configures `Args` to match — do not add a manual
+  flag for it.
 - **`128*4*4*4` in the non-pooled branch is already correct**, since it equals
   `128*8*8 = 8192` for a 128×128 input. Only the inline `[4,4]` shape comments
   are stale. Do not "fix" the arithmetic.
@@ -471,7 +472,7 @@ Per episode, log:
 `separation` and `relative_yaw` were the *hypothesised* failure axes, and both
 have since been superseded by measurement — see Current state. Keep logging them
 (they are pinned columns and the report shows the before/after), but regress
-against the derived features in `t2_common.geom_features`:
+against the derived features in `t2/geometry.py`'s `geom_features`:
 
 - **`face_gap`** = `separation − extentA(bearing) − extentB(bearing)`, the
   clearance between cube *faces*. Both yaws enter, through the A→B bearing. This
@@ -481,8 +482,10 @@ against the derived features in `t2_common.geom_features`:
   world origin. Success against `dist_max` is an inverted U, so **bin both
   tails**; fitting a trend hides half the effect.
 
-These are derived, not logged, so every CSV mined before they existed gains them
-at analysis time via `geom_from_row`. Nothing needs re-mining.
+`eval_modes.py` now logs them as columns AND `verify.py` recomputes them from
+the poses to check they agree, so the stored value and the derivation cannot
+drift. Older CSVs that predate the columns still gain them at analysis time via
+`geom_from_row`; nothing needs re-mining.
 
 **Log full initial states + success flags for every rollout, always** — including
 diagnostic runs. T-II is near-impossible to do well retroactively without this.
@@ -535,15 +538,39 @@ On the laptop, for reading source without a pod:
 ~/ripl/demos        rsync target for pulled datasets
 ```
 
+### Python packages on the laptop: `nix-shell -p`, not `pip`
+
+The laptop is NixOS and the system `python3` has **no numpy** — so the pure-CSV
+analysis tools fail to import unless they are run inside a shell that provides
+one. Do not `pip install`; there is no writable site-packages to install into.
+
+```bash
+nix-shell -p "python3.withPackages(ps: [ps.numpy ps.matplotlib])" \
+  --run "python3 t2/report.py t2/results/nominal.csv"
+```
+
+Measured working: numpy 2.5.1, matplotlib 3.11.1. The first invocation builds
+the environment (~1 min); later ones hit the store and start instantly. Note
+the package set must be attached to the interpreter — a bare
+`nix shell nixpkgs#python3Packages.numpy` puts the package in the store but
+leaves the `python3` on PATH unable to see it, which fails in a way that looks
+like the package is missing.
+
+**This is why `t2/geometry.py` and `t2/test_geometry.py` import nothing but
+`math` and `csv`.** The definition of a failure mode, and its tests, must be
+checkable with the bare system interpreter and no shell at all — that is the
+layer where being wrong is most expensive and feedback should be cheapest.
+Everything needing numpy or matplotlib lives above them.
+
 Inside this repo, one directory per assignment task (see The scripts, below):
 
 ```
 setup/    pod build, patching, transfer, smoke gates
 t1/       run_pipeline.sh - data replay + both training runs
-t2/       run_t2.sh and the mining/analysis harness
+t2/       run.sh, the failure-mode evaluation - see t2/README.md
 patches/  patches applied to the ManiSkill checkout
 notes/    debugging narratives; report material, not overhead
-figures/  analyze_rollouts.py's output, committed
+figures/  report.py's output, committed
 ```
 
 ---
@@ -574,45 +601,43 @@ Thin on purpose. It is one command because StackCube ships one raw
 
 ### `t2/` — the failure-mode harness
 
+**Read `t2/README.md` first.** It is the method walkthrough: which code finds the
+seeds, which code runs the policy on them, which code turns outcomes into
+numbers, and what each check proves. This table is only the file map.
+
 | | |
 |---|---|
-| `run_t2.sh` | Driver. `index` \| `t1` \| `mine` \| `region` \| `backend` \| `videos` \| `analyze` \| `plan` \| `all`. |
-| `run_all.sh` | **Everything T-II still needs, in order.** `preflight` \| `index` \| `size` \| `modes` \| `feasible` \| `backend` \| `analyze` \| `verify` \| `all`. Derives `CKPT`; resumable. |
-| `run_modes.sh` | The three pre-registered per-mode evaluations. `size` \| `gap` \| `farb` \| `nearbase` \| `analyze` \| `all`. |
-| `verify.py` | Asserts a finished pass is what it claims. No sim. Exits non-zero, so it can gate a report. |
-| `t2_common.py` | Angle conventions, cube + **geometry** features, Wilson, checkpoint loading, manifests. |
+| `geometry.py` | What a failure mode **is**. `MODES`, `face_gap`, `dist_*`, the seed blocks, `COLUMNS`, Wilson. **Pure stdlib** — imports `math` and nothing else. |
+| `harness.py` | The simulator half: `CubePoseInfo`, checkpoint loading, `build_agent`, manifests. Imports gym/torch unconditionally. |
 | `seed_index.py` | seed → initial state, **policy-free**. No GPU, minutes. |
-| `select_seeds.py` | Pick seeds by any condition on the initial state. `--dry-run` sizes a pass. |
-| `mine_rollouts.py` | The overnight miner. Parallel, resumable, fully logged. |
+| `eval_modes.py` | **The deliverable.** Per-mode success over 100 rollouts × 3 seeds, plus a nominal reference arm in the same shape. |
+| `verify.py` | Asserts a finished pass is what it claims. No sim, no numpy. Exits non-zero, so it can gate a report. |
+| `report.py` | The tables and the three figures. |
+| `policy_check.py` | Proves the rollouts are driven by the trained weights, by racing them against untrained / random / zero. |
 | `record_seeds.py` | mp4s for named seeds, retried until the outcome matches. |
-| `analyze_rollouts.py` | Curves, taxonomy, Wilson intervals, video shortlist. |
-| `rollout_log.py` | The localisation probe. `num_envs=1`; produced the reach-error numbers. |
-| `backend_check.py` | Does `physx_cuda` reproduce `physx_cpu`? Paired by injected initial state, not by seed. |
-| `reach_map.py` | Reachable set for the frozen top-down gripper. **Policy-free**, needs ManiSkill. |
-| `demo_feasibility.py` | The motion planner as a feasibility oracle. A metadata join; no sim needed. |
+| `run.sh` | The one driver. `test` \| `index` \| `check` \| `eval` \| `verify` \| `report` \| `videos` \| `all`. |
+| `test_geometry.py` | The geometry against hand-computed cases. No deps, ~1 s. |
+| `test_verify.py` | Fabricates a valid pass, corrupts it twelve ways, checks `verify.py` catches each. No deps, ~2 s. |
 
-Three placement calls, so they are not re-litigated:
+**The split at `geometry.py` / `harness.py` is the load-bearing structural
+call**, and it replaces an optional-import dance that did not work. `t2_common.py`
+imported numpy at module scope while claiming its consumers ran "on a laptop with
+no ManiSkill install" — they did not; this laptop has no numpy and every analysis
+tool failed to import. Now:
 
-- **`t2_common.py` imports gymnasium and torch *optionally*.** `analyze_rollouts.py`,
-  `select_seeds.py` and `demo_feasibility.py` are pure-CSV tools and must run on
-  a laptop with no ManiSkill install — which is the same reason the saved state
-  arrays carry their own column names. Only the rollout half needs the sim, and
-  only it fails without one.
-
-- **`rollout_log.py` lives in `t2/` even though its reach-error numbers are T-I
-  material.** It does `import t2_common`, and python only puts a script's *own*
-  directory on `sys.path` — from `t1/` that import breaks. It is a rollout
-  harness sharing the T-II conventions module, so it lives with them.
-- **`run_t2.sh t1` is a T-I deliverable produced by the T-II harness**, and that
-  is deliberate rather than a filing mistake. T-I's error bars cannot come from
-  the training logs (see above), so the standalone harness is what produces
-  them. One tool, two deliverables.
+- **`geometry.py` imports `math` and nothing else.** The definition of a failure
+  mode, its tests, and `verify.py` all run on the bare system interpreter. That
+  is the layer where being wrong is most expensive, so feedback there is free.
+- **`harness.py` imports gym/torch unconditionally** and fails loudly off-pod,
+  rather than degrading into a half-working module.
+- Anything needing numpy or matplotlib (`report.py`, `eval_modes.py`,
+  `seed_index.py`) sits above both. See the nix-shell note under Infrastructure.
 
 `ENV_ID` is a variable in both `t1/run_pipeline.sh` and `setup/smoke_test.sh`.
 The task has changed once; changing it again should cost one export, not a
 rename.
 
-`figures/` at the repo root is `analyze_rollouts.py`'s output and is committed.
+`figures/` at the repo root is `report.py`'s output and is committed.
 
 ---
 
@@ -715,13 +740,18 @@ is load-bearing and Blackwell cards already have an open ManiSkill issue.
   the CPU one for the same seed. Worse, `reset()` seeds the whole batch from
   `self._episode_seed[0]` (`sapien_env.py:950-953`) while `_initialize_episode`
   draws `(b, 2)` at once - so at width > 1 every env's state derives from env
-  0's seed and depends on the batch width. `mine_rollouts.py` asserts the
-  episode seed came back as requested; `_episode_seed` IS recorded per-env, so
-  the assert passes while the states it is supposed to guarantee are not the
-  ones asked for. **The seed index and every T-II seed list are `physx_cpu`
-  artifacts.** Do not port them. `t2/backend_check.py` compares the backends by
-  replaying exact initial states instead, which is what licenses T-IV training
-  on GPU and evaluating on CPU.
+  0's seed and depends on the batch width. `eval_modes.py` asserts the episode
+  seed came back as requested; `_episode_seed` IS recorded per-env, so on GPU
+  that assert PASSES AND LIES — the states it is supposed to guarantee are not
+  the ones asked for. **The seed index and every T-II seed list are `physx_cpu`
+  artifacts.** Do not port them.
+
+  T-IV will want to train on GPU and evaluate on CPU, and licensing that split
+  needs a paired check that replays exact initial states through
+  `options={"reset_to_env_states": ...}` rather than addressing episodes by
+  seed. `t2/backend_check.py` did this and was removed with the rest of the
+  discovery-era harness; recover it from git history (`git log --diff-filter=D
+  --  t2/backend_check.py`) rather than rewriting it.
 - **`train.py`'s flag names move between ManiSkill releases.** Re-check
   `--help` rather than trusting any doc, including this one.
 - **`--capture-video` defaults to True.** Pass `--no-capture-video` for anything
@@ -744,8 +774,9 @@ is load-bearing and Blackwell cards already have an open ManiSkill issue.
   [0, 1000) are training initial states**. Evaluating there measures
   memorisation. Measured on the same checkpoint: **0.910 on seeds 0-299 vs
   0.713 on held-out seeds 1000-2199**, with the gap uniform across every
-  separation bin, flat over the run and flat across workers. `t2/run_t2.sh`
-  now refuses `T1_BASE < DEMO_SEED_CEILING`. This bit us for real — the first
+  separation bin, flat over the run and flat across workers. `geometry.RESERVED`
+  now names the block and `eval_modes.py` refuses to log an episode inside it,
+  while `verify.py` re-checks offline. This bit us for real — the first
   production T-I pass ran on seeds 0-299.
 
 ---
@@ -773,87 +804,84 @@ is load-bearing and Blackwell cards already have an open ManiSkill issue.
   arc that produced it — the wrong "it's blind" diagnosis, the data lever and
   where it ran out, the encoder finding — is written up in
   `notes/rgb-localisation.md`.
-- **The production T-II pass has run**, and its axes have since been corrected.
-  1,900 episodes, RTX 4090, 55 min at ~2,000 ep/h. Full write-up in
-  `notes/t2-failure-modes.md`. Headlines:
+- **The production T-II pass has run**, and the harness has since been rebuilt
+  around its result. 1,900 episodes, RTX 4090, 55 min at ~2,000 ep/h. Narrative
+  in `notes/t2-failure-modes.md`; method in `t2/README.md`. Headlines:
   - **T-I = 0.737**, SD 0.078 over 3 × 100 on held-out seeds 6000–6299; 0.713
     [0.687, 0.738] on the 1,200-episode nominal pass. The 0.910 from the first
-    `t1` pass was measured on seeds 0–299, which are *training* initial states —
-    see the demo-seed trap. That gap is a memorisation result, not a T-I number.
-  - **`separation` is the wrong axis, and both original modes are restated on
-    better ones.** Measured on the same 1,200 held-out episodes, no new data:
-    - **`face_gap`** — the clearance between cube *faces* along the A→B bearing,
-      so both yaws enter. 0.500 at 5–20 mm rising to 0.794 at 70–120 mm, and it
-      survives controlling for separation (within sep < 100 mm: 0.524 low-gap vs
-      0.670 high-gap). Mechanism in the source: the gripper's orientation is
-      frozen at reset, so the policy cannot square up to a misaligned cube.
-    - **`dist_max` / `dist_min` from `PANDA_BASE_XY`** — an inverted U. 0.467
-      below 520 mm, 0.774 mid-band, 0.508 above 760 mm. The old "separation >
-      260 mm" mode is largely this one seen through a correlated variable; the
-      2×2 puts the separation tail at −0.084, the reach tail at −0.198, both at
-      −0.356.
-  - **The reach band's two ends fail by different mechanisms**, which is what
-    makes them separate modes. Far cubeA spikes `never grasped` to 0.149 against
-    a 0.016 base rate; far cubeB leaves it at 0.015 and fails at placement;
-    near-base grasps normally and fails at placement at 0.178 vs 0.069.
-  - **Toppling is not a third mode.** It is 28.7% of placements, but no
-    initial-state feature predicts it. What does is `cubeB_displacement` (hold
-    rate 0.919 → 0.032), an outcome — so it is the face-gap mode's downstream
-    consequence. This closes a question `CLAUDE.md` previously left open.
-  - **T-IV carries two targets** — `face_gap < 25 mm` and far-cubeB-with-cubeA-
-    comfortable — chosen because they fail at *different stages* by *different*
-    mechanisms. See the decision point below; an earlier claim that the reach
-    mode was not residual-fixable has been retracted there.
-  - **Beware `far_is_B` as a mechanism split.** The `never_grasped = 0.149` for
-    "far cube = A" mixes in both-cubes-far episodes. Isolating cubeA ≥ 760 mm
-    with cubeB < 720 mm gives 0.083, and the grasp failures actually concentrate
-    in the both-far corner (0.815 above 740 mm). Condition on the *other* cube
-    when attributing a mechanism to one of them.
+    pass was measured on seeds 0–299, which are *training* initial states — see
+    the demo-seed trap. That gap is a memorisation result, not a T-I number.
+  - **`separation` is the wrong axis; `face_gap` and reach-from-base are the
+    right ones.** Measured on the same 1,200 held-out episodes, no new data.
+  - **TWO modes, and they fail at different stages by different mechanisms.**
+    This is the T-II result, and it comes straight out of the flags:
+
+    | | region | n | success | grasped | placed | held\|placed |
+    |---|---|--:|--:|--:|--:|--:|
+    | — | *nominal* | 1200 | 0.713 | 0.984 | 0.884 | 0.807 |
+    | **A** | `face_gap < 20 mm`, `dist_max < 760 mm` | 44 | 0.523 | 0.955 | **0.659** | 0.793 |
+    | **B** | `dist_B ≥ 760`, `dist_A < 720`, `face_gap ≥ 50` | 41 | 0.561 | **1.000** | 0.854 | **0.657** |
+
+    A loses **placement** and holds normally once placed — the descent onto cubeA
+    fouls cubeB, and the gripper cannot rotate to square up (orientation is
+    frozen at reset). B grasps *perfectly* and places near baseline, then the
+    stack does not settle. Provably disjoint: 0 of 1,200 satisfy both.
+  - **The third mode (`nearbase`) and the three-control filters were dropped.**
+    `gap`'s `dist_min >= 0.52` floor existed only to keep it disjoint from
+    `nearbase`; with that mode gone the floor only diluted the effect
+    (0.640 with it, 0.523 without). Two modes, one control each, each excluding
+    the other's factor. Recorded here so it is not silently reversed.
+  - **Toppling is not a separate mode.** It is 28.7% of placements, but no
+    initial-state feature predicts it. What does is `cubeB_displacement`, an
+    outcome — so it is mode A's downstream consequence, not a third region.
+  - **Beware `far_is_B` as a mechanism split.** Grasp failures concentrate in the
+    both-cubes-far corner (0.815 above 740 mm), where no bounded residual can
+    recover a target the IK cannot reach. That corner is excluded from mode B by
+    `dist_A < 0.72` rather than left in to depress the result. Condition on the
+    *other* cube when attributing a mechanism to one of them.
   - The gate holds comfortably: 0.713 is well below 1, and the nominal pass
     yields 344 failures rather than the ~13 that 0.87 would have given.
+- **The harness was rebuilt** (11 files → 10, ~2,900 lines → ~1,500), collapsing
+  three shell drivers into `t2/run.sh` and splitting `t2_common.py` into a
+  dependency-free `geometry.py` and a sim-only `harness.py`. Two live bugs were
+  found and removed in the process: region selection reached into T-I's seed
+  block, and the index was too small for `farb` to fill. See the T-II harness
+  section.
 - **Next, in order:**
   1. `bash setup/apply_patches.sh` on the pod (after `setup_runpod.sh`, which
      re-clones ManiSkill and wipes the patch).
-  2. `bash t2/run_all.sh` — everything below in one command, resumable, ~1 h.
-     The stages are listed separately here because they can be run piecemeal.
-  3. `python t2/demo_feasibility.py $MS_ASSET_DIR/demos/StackCube-v1/motionplanning/trajectory.json`
-     and `python t2/reach_map.py` — do the far-reach failures belong to the
-     policy or to the task? Both are cheap; the first is a metadata join.
-  4. `bash t2/run_t2.sh backend` — needs a GPU. Licenses T-IV's train-on-GPU,
-     evaluate-on-CPU split. Not part of `all`.
-  5. `bash t2/run_t2.sh analyze`, then `videos` on the shortlist it prints —
-     preferably seeded from the region lists so each clip illustrates a mode.
-  6. Pull before stopping the pod: `bash setup/transfer.sh info`. Figures do
+  2. `bash t2/run.sh all` — self-tests, index, policy check, the 3 × 100 × 3
+     evaluation, verify, report. Resumable, ~40 min.
+  3. **`verify.py` must exit 0 before any of it is reported.**
+  4. `SEEDS=... bash t2/run.sh videos` — pick seeds from the mode CSVs so each
+     clip illustrates a mode. mp4s are a T-II deliverable.
+  5. Pull before stopping the pod: `bash setup/transfer.sh info`. Figures do
      **not** come back by git; the pod never pushes.
 
 ---
 
 ## The T-II harness
 
-`bash t2/run_t2.sh <stage>` — the file-by-file map is in The scripts, above.
-Read this section before adding a stage.
+**`t2/README.md` is the method walkthrough — read it before changing anything
+here.** This section holds only the decisions that would otherwise be
+re-litigated.
 
-The rollout stages use **disjoint seed blocks**: `t1` takes [0, 300) as three
-blocks of 100 with three policy seeds, `mine` takes [1000, 1000+NOMINAL), and
-`region` draws only from seeds above that. Disjointness is not tidiness — a T-I
-number that shares episodes with the T-II substrate is not an independent check
-on it, and re-measuring a region on the rollouts that found it measures noise.
-
-`rollout_log.py` stays what it is: the **localisation probe**, `num_envs=1`, the
-thing that produced the reach-error numbers above. It shares `t2_common.py` with
-the miner so the two cannot disagree on the wrap convention or on which weights
-get loaded.
+`bash t2/run.sh <stage>` is the one driver:
+`test | index | check | eval | verify | report | videos | all`. It replaced three
+shell drivers that called each other (`run_all.sh` -> `run_modes.sh` ->
+`run_t2.sh`), which is how a 20-seed collision with the T-I block survived
+review.
 
 ### The seed index is the load-bearing idea
 
 `reset(seed=s)` is deterministic (`sapien_env.py:950-953`), so **a seed is a
-lossless 8-byte encoding of the whole 70-float initial state.** Tabulating
-seed → cube poses needs resets only — no policy, no 200-step rollout, no GPU.
+lossless 8-byte encoding of the whole initial state.** Tabulating seed → cube
+poses needs resets only — no policy, no 200-step rollout, no GPU.
 
 That turns T-II's "resample *fresh* episodes from the failure region" into
-rejection sampling over integers: filter the index for `separation < 0.080`,
-hand the surviving seeds to the miner. The episodes that come back are drawn
-from exactly the env's own conditional distribution given the region. No state
+rejection sampling over integers: filter `seeds.csv` for the region, hand the
+surviving seeds to `eval_modes.py`. The episodes that come back are drawn from
+exactly the env's own conditional distribution given the region. No state
 injection, no distribution shift, every episode reproducible from one integer.
 
 It also means **no exploratory question about initial states can be foreclosed
@@ -865,59 +893,108 @@ replaces `_initialize_episode` wholesale (robot qpos and table pose would have
 to be synthesised too) and broadcasts identically to every worker under
 `AsyncVectorEnv`. Save it for T-III, where a biased distribution is the goal.
 
-### What gets logged, and why that split
+### Seed blocks are allocated from one shrinking pool
 
-**Initial state: the seed suffices, but log it anyway.** Redundant by
-construction, ~1.7 MB, and it makes the dataset self-contained — the analysis
-reproduces from committed files without a ManiSkill install. It also carries
-the one part of the initial state the cube columns ignore: the Panda's
-randomised initial qpos (`robot_init_qpos_noise=0.02`), so "arm configuration
-doesn't matter" becomes testable rather than assumed.
+Defined once, in `geometry.RESERVED` and `geometry.EVAL_BASE`:
 
-**Terminal and trajectory state: log it, because it cannot be regenerated.**
-The rollout is stochastic — that episode happened once, and re-running the seed
-produces a different one. Hence the terminal state dict and a stride-5 trace
-(cubeA/cubeB/tcp xyz + the 4 flags) for every episode, stride-1 for the region
-pass. This is what separates *locating* a failure region from *explaining* one:
-`success_once` says an episode failed, the trace says whether cubeB was
-displaced during the approach or during the placement, and those are two
-different modes.
+```
+[0, 1000)      demonstrations   training initial states — NEVER evaluate here
+[1000, 2200)   discovery        the 1,200-episode nominal pass (done)
+[6000, 6300)   T-I              the 3 × 100 T-I deliverable (done)
+[10000, ...)   EVAL_BASE        everything eval_modes.py draws
+```
 
-Not doing `RecordEpisode(save_trajectory=True)` during mining: `make_eval_envs`
-attaches it to sub-env 0 only (`make_env.py:52`), so capturing all workers means
-forking the thunk and giving up the bit-identical-to-training eval path that
-makes these numbers comparable to T-I.
+`eval_modes.select_seeds` builds one pool above `EVAL_BASE` with every reserved
+block removed, then allocates modes from it in a fixed order, removing each seed
+as it goes. Two blocks cannot share an episode because the pool never offered
+one twice — **the property is removed rather than checked for afterwards.**
+
+That is not tidiness. The previous harness selected per-region from `seed >=
+2200` and needed ~5,000 eligible seeds to fill a 300-seed region, which reached
+straight through T-I's `[6000, 6300)` block and silently pulled in 20 of its
+seeds. A T-I number sharing episodes with the T-II substrate is not an
+independent check on it.
+
+### Verification is layered, and each layer closes a different hole
+
+Do not collapse these into one script; they fail for different reasons.
+
+| | proves | needs |
+|---|---|---|
+| `test_geometry.py` | the *definition* of a failure mode is right | nothing |
+| `test_verify.py` | **the checker catches things** — 11 corruptions, one at a time | nothing |
+| `eval_modes.py`'s 4 reset assertions | a bad episode is never *logged* | the sim |
+| `verify.py` | the finished pass is what it claims | nothing |
+| `policy_check.py` | the actions came from *these weights* | the sim |
+
+The strongest offline check is free: the poses in an evaluation CSV were read
+out of the *environment* at reset, while the poses in `seeds.csv` came from
+`seed_index.py`, a separate policy-free script. Their agreeing proves the env
+reset to the seed requested, the seed→state map is deterministic, AND the filter
+selected seeds whose actual states satisfy the condition — three claims, one
+join, no simulator.
+
+`policy_check.py` closes the one hole none of the offline checks can see: a
+harness that silently fell back to random actions would still produce a CSV
+whose initial states cross-check perfectly.
+
+### What gets logged, and what deliberately does not
+
+One row per episode, schema pinned in `geometry.COLUMNS` (which `verify.py`
+asserts the header against), plus a manifest carrying the checkpoint's SHA-256.
+
+The `ever_grasped` / `ever_placed` / `ever_static` flags come free from
+`evaluate()`'s info dict and are **the whole taxonomy** — they turn a binary
+failure into a mechanism, and they are what distinguish the two modes.
+`cubeB_displacement` measures mode A's proposed mechanism directly.
+
+**Dropped, deliberately, from the old miner:** the stride-5 `_trace.npz` and the
+70-float `_states.npz`. Those existed to *find* the mechanisms; the mechanisms
+are found and written up, and carrying them made every pass 4 MB and the miner
+100 lines longer. If a future question needs a trajectory, the seed regenerates
+the episode.
+
+`--repeats` is gone too. It measured "is this state hard, or is the policy
+noisy" — already answered at 0.74 / 0.67 agreement — and the 3-block structure
+is what carries the error bar.
+
+Not doing `RecordEpisode(save_trajectory=True)` during evaluation:
+`make_eval_envs` attaches it to sub-env 0 only (`make_env.py:52`), so capturing
+all workers means forking the thunk and giving up the bit-identical-to-training
+eval path that makes these numbers comparable to T-I. `record_seeds.py` is the
+separate single-process video pass instead.
 
 ### Two conventions that differ from a naive reading
 
 - **`relative_yaw_mod90`.** A cube has 4-fold yaw symmetry, so `+85°` and `−5°`
-  are the *same* geometry. CLAUDE.md's pinned `(−π, π]` column is logged exactly
-  as specified, but it is the wrong axis to regress against — it splits one
-  physical configuration across two ends of the range. Analysis uses the mod-90
-  column. Both are logged.
-- **`face_gap` can go negative**, and that is meaningful rather than a bug: it
-  means the two cubes' bounding squares overlap along the bearing between them,
-  which the sampler's 58.6 mm centre-separation floor does not exclude for
+  are the *same* geometry. The pinned `(−π, π]` column is logged exactly as
+  specified, but it is the wrong axis to regress against — it splits one
+  physical configuration across two ends of the range. Both are logged. Note
+  `±45°` is genuinely ambiguous (it is the boundary), so never assert an exact
+  mod90 value near it, and fold `|mod90|` before binning.
+- **`face_gap` can go negative**, and that is meaningful rather than a bug: the
+  two cubes' bounding squares overlap along the bearing between them, which the
+  sampler's 58.6 mm centre-separation floor does not exclude for
   diagonally-presented cubes. Do not clamp it.
 - **Wilson, not `sqrt(p(1−p)/n)`.** At n≈100 the interesting bins sit near
   p = 0, where the normal interval runs below zero and claims certainty it does
   not have — a 0/20 bin gets ±0.000 from the normal formula and [0, 0.161] from
-  Wilson. Same data, honest bars.
+  Wilson. Same data, honest bars. `wilson` pins the exact bounds at k=0 and k=n
+  (they are analytically 0 and 1, but computing `c ± h` lands a few ULP short,
+  which matplotlib rejects as a negative error bar).
 
 ### Pre-registration
 
-The 80 mm threshold comes from the sampler analysis above, **written down before
-any rollout ran**. The three refined thresholds — `face_gap < 25 mm`,
-`dist_min < 520 mm`, `dist_max ≥ 760 mm` — are written down in
-`notes/t2-failure-modes.md` and in `t2/run_modes.sh` before their passes ran,
-along with the nominal-pass success rate each one has to reproduce on fresh
-seeds. Every region pass draws its seeds from above the nominal range so the
-passes are disjoint — re-measuring on the rollouts that found the region
-measures noise.
+The thresholds live in `geometry.MODES` alongside `geometry.DISCOVERY`, the rate
+each one must reproduce on fresh seeds — both written down before any
+confirmation rollout ran, and both asserted against the committed evidence by
+`test_geometry.py`. `verify.py` prints the confirmation rate against the
+prediction.
 
-The three refined filters also **partition on `dist_min` and `dist_max`**, so
-they are mutually exclusive and each controls for the other modes' factor.
-Without that they contaminate each other and none of the numbers means anything.
+The two filters are **mutually exclusive by construction** (`dist_max < 0.76` vs
+`dist_B >= 0.76`), verified at 0 overlap in 1,200 episodes, and each carries
+exactly one control excluding the *other* mode's factor. Without that they
+contaminate each other and neither number means anything.
 
 Say all of this in the report; a threshold fixed in advance is a materially
 stronger claim than one chosen after seeing the scatter.
@@ -978,13 +1055,17 @@ same as T-I's. That means three **disjoint blocks of 100 region seeds**, each
 run under its own policy seed — not one block of 100 evaluated three times.
 Reusing one block and varying only the policy seed holds the initial states
 fixed and measures DDPM sampling noise, which is a much smaller quantity than a
-real error bar. `run_t2.sh do_region` does the former; it did the latter until
-this was checked, and got the shape wrong (200 seeds × 2 repeats at one policy
-seed).
+real error bar. `eval_modes.py` does the former and `verify.py` check 6 refuses
+the latter; the harness got this wrong twice before it was checked (200 seeds ×
+2 repeats at one policy seed, then a shape that was right but drew its seeds
+through T-I's block).
 
-The full 300-seed list per mode is also **the targeted-evaluation set** that
-T-III biases toward and T-IV is scored on. `region_<tag>_seeds.csv` is that
-artifact — fix it once and reuse it, or the before/after is not a comparison.
+The full 300 seeds per mode are also **the targeted-evaluation set** that T-III
+biases toward and T-IV is scored on. They live in the `seed` column of
+`mode_<tag>_seed<b>.csv` — fix them once and reuse them, or the before/after is
+not a comparison. `eval_modes.py` is deterministic given the index, so re-running
+it selects the same seeds; it is the index that must not be rebuilt at a
+different size.
 
 **Never cut:** the T-I baseline number, the quantitative failure
 characterisation, and the nominal-distribution re-evaluation after finetuning.

@@ -40,7 +40,8 @@ import sys
 import numpy as np
 import torch
 
-from t2_common import build_agent, cube_features, flag, to_device
+from geometry import cube_features
+from harness import build_agent, flag, to_device
 
 MAX_EP_STEPS = int(os.environ.get("MAX_EP_STEPS", 200))
 

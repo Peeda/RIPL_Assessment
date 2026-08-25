@@ -30,7 +30,8 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from t2_common import build_agent, manifest, to_device, wilson  # noqa: E402
+from geometry import wilson  # noqa: E402
+from harness import build_agent, manifest, to_device  # noqa: E402
 
 MAX_EP_STEPS = 200
 

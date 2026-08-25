@@ -617,3 +617,107 @@ two half-trained runs.
 residual that fixes its region and degrades everywhere else is not an
 improvement, and at 3 × 100 rollouts "near-zero degradation" is a claim the data
 supports only weakly — say so.
+
+
+---
+
+## The harness was rebuilt around this result (2026-08-25)
+
+Everything above is the *discovery* arc: the axes were found by slicing a
+1,200-episode held-out pass, and the harness that produced it grew one script at
+a time while the question was still open. Once the answer was two modes, that
+shape stopped earning its keep — three shell drivers calling each other, a
+generic `--where` seed selector, a 552-line analysis monolith, and four
+diagnostic scripts whose questions were settled.
+
+It was collapsed to one driver (`t2/run.sh`) and one deliverable script
+(`t2/eval_modes.py`). The method is written up in **`t2/README.md`**, which is
+now the place to start.
+
+### Two live bugs fell out of the rewrite
+
+Both would only have surfaced *after* an hour of GPU time.
+
+1. **Region selection reached into the T-I evaluation block.** Filling a
+   300-seed region at `gap`'s 6% hit rate needs ~5,000 eligible seeds, so
+   selecting from `seed >= 2200` ran past 6000 and picked up **20 seeds** (17
+   for `farb`) that are inside T-I's `[6000, 6300)`. The old `verify.py` would
+   have caught it after the fact. It is now impossible by construction: every
+   evaluation draws from one shrinking pool above `EVAL_BASE = 10000`, which
+   sits above every block already measured.
+
+2. **The index was too small to fill `farb`.** At 3.4% of eligible seeds, the
+   8,000-seed index yielded 196 of the 300 needed. `seed_index.py` now reports
+   per-mode availability and the index size each would require, for free, at the
+   end of every index build.
+
+A third, smaller one: `t2_common.py` imported numpy at module scope while its
+docstring claimed the pure-CSV tools ran "on a laptop with no ManiSkill
+install". They did not — the laptop has no numpy, and every analysis tool failed
+to import. The module is now split into `geometry.py` (stdlib only) and
+`harness.py` (sim only).
+
+### The third mode and the third control were dropped
+
+`nearbase` (`dist_min < 520 mm`) was a real finding and is kept in the record
+above, but it is not carried into the deliverable. Two modes that fail at
+different stages by different mechanisms is a stronger result than three slices,
+and the budget is better spent on 300 fresh episodes each.
+
+Dropping it also simplified `gap`. Its `dist_min >= 0.52` floor existed *only*
+to keep it disjoint from `nearbase`; with that mode gone the floor did nothing
+but dilute the effect:
+
+| `gap` definition | n | success |
+|---|--:|--:|
+| `face_gap < 25`, `520 <= dist_min`, `dist_max < 760` (old) | 50 | 0.640 [0.501, 0.759] |
+| `face_gap < 20`, `dist_max < 760` (**current**) | 44 | **0.523** [0.379, 0.662] |
+| `face_gap < 20` raw, no control | 49 | 0.490 [0.356, 0.625] |
+
+The old definition's interval overlaps the 0.713 baseline — it was reporting a
+weaker effect than the data contains, because the floor removed the near-base
+episodes that also fail. The current one keeps a single control, `dist_max <
+760`, which exists to exclude **mode B's** factor and nothing else.
+
+`farb` is unchanged. The two are now mutually exclusive on `dist_max < 0.76` vs
+`dist_B >= 0.76` alone — verified at **0 overlap in 1,200 episodes**, asserted by
+`t2/test_geometry.py`.
+
+Recorded here so the decision is on the record rather than silently reversed by
+someone who reads only the sections above.
+
+### The pre-registered numbers, restated
+
+These are what the 3 × 100 confirmation passes must reproduce on fresh seeds
+drawn from above seed 10,000. They live in `geometry.DISCOVERY`, and
+`test_geometry.py` asserts they still match `results/nominal.csv`.
+
+| mode | n | success | 95% CI | grasped | placed | held \| placed |
+|---|--:|--:|---|--:|--:|--:|
+| nominal | 1200 | 0.713 | [0.687, 0.738] | 0.984 | 0.884 | 0.807 |
+| `gap` | 44 | 0.523 | [0.379, 0.662] | 0.955 | **0.659** | 0.793 |
+| `farb` | 41 | 0.561 | [0.410, 0.701] | **1.000** | 0.854 | **0.657** |
+
+A confirmation landing outside its interval is informative, not a failure — the
+prediction rests on ~40 episodes and the confirmation on 300. What must hold is
+the **mechanism split**: `gap` low on placement with normal hold-given-placement,
+`farb` at ~1.0 grasp and normal placement with hold-given-placement collapsed.
+If that inverts, the two modes are not what this note says they are.
+
+### What verification looks like now
+
+Layered, because the layers fail for different reasons:
+
+| | proves | needs |
+|---|---|---|
+| `test_geometry.py` | the *definition* of a failure mode is right | nothing |
+| `test_verify.py` | **the checker catches things** — 11 corruptions, one at a time | nothing |
+| `eval_modes.py`'s reset assertions | a bad episode is never *logged* | the sim |
+| `verify.py` | the finished pass is what it claims | nothing |
+| `policy_check.py` | the actions came from *these weights* | the sim |
+
+`test_verify.py` is the one worth naming. A checker nobody has tried to fool is
+not evidence, so it fabricates a valid pass and then corrupts it twelve ways —
+including the two mistakes this note records above (evaluating on demonstration
+seeds; a region pass sharing episodes with another block) and the misreading of
+"3 seeds" from the section above. All twelve are caught.
