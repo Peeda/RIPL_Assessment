@@ -562,6 +562,10 @@ checkable with the bare system interpreter and no shell at all — that is the
 layer where being wrong is most expensive and feedback should be cheapest.
 Everything needing numpy or matplotlib lives above them.
 
+The frozen base policy is IN THE REPO at
+`checkpoints/stackcube_rgb_spatial_800demos.pt`, so nothing downstream depends
+on a pod's filesystem surviving. See the git rule under Working rules.
+
 Inside this repo, one directory per assignment task (see The scripts, below):
 
 ```
@@ -615,7 +619,7 @@ numbers, and what each check proves. This table is only the file map.
 | `report.py` | The tables and the three figures. |
 | `policy_check.py` | Proves the rollouts are driven by the trained weights, by racing them against untrained / random / zero. |
 | `record_seeds.py` | mp4s for named seeds, retried until the outcome matches. |
-| `run.sh` | The one driver. `test` \| `index` \| `check` \| `eval` \| `verify` \| `report` \| `videos` \| `all`. |
+| `run.sh` | The one driver. `test` \| `index` \| `check` \| `smoke` \| `eval` \| `verify` \| `report` \| `videos` \| `all`. Defaults `CKPT` to the in-repo checkpoint. |
 | `test_geometry.py` | The geometry against hand-computed cases. No deps, ~1 s. |
 | `test_verify.py` | Fabricates a valid pass, corrupts it twelve ways, checks `verify.py` catches each. No deps, ~2 s. |
 
@@ -677,10 +681,22 @@ is load-bearing and Blackwell cards already have an open ManiSkill issue.
   criterion — small, coherent commits with real messages.
 - **Commit from the laptop only.** The pod clones and `git pull`s; it never
   pushes. Anything uncommitted on a pod is one Terminate away from gone.
-- **Nothing large goes into git.** `.gitignore` covers `*.h5`, `runs/`,
-  `wandb/`, `env.sh`. Committing a big blob is one of the few mistakes with no
-  cheap undo — `git rm` doesn't remove it from history. Never `git add -A`
-  without checking what it caught.
+- **Nothing large goes into git, with exactly one exception.** `.gitignore`
+  covers `*.h5`, `*.pt`, `runs/`, `wandb/`, `env.sh`. Committing a big blob is
+  one of the few mistakes with no cheap undo — `git rm` doesn't remove it from
+  history. Never `git add -A` without checking what it caught.
+
+  The exception is **`checkpoints/stackcube_rgb_spatial_800demos.pt`** (33 MB),
+  the frozen base policy: the T-I deliverable, the weights every T-II number
+  came from, and what T-IV's residual sits on. It is committed so the harness
+  runs with no env var and no rsync from a pod that may already be terminated —
+  the evidence base has to be re-derivable after the pod is gone. It carries
+  `ema_agent` only, which halves it and loses nothing (`load_weights` never
+  reads the raw `agent`). Rationale and provenance in `checkpoints/README.md`.
+
+  The `.gitignore` negations are **by filename**, not `!checkpoints/*.pt`, so a
+  training run writing `best_eval_success_at_end.pt` into that directory is
+  still ignored. Do not widen them.
 
 **Running things**
 - Anything long-running goes in `tmux`, then poll the log. Do not foreground a

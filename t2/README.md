@@ -373,6 +373,13 @@ tmux new -s t2
 bash t2/run.sh all 2>&1 | tee ~/t2.log
 ```
 
+No `CKPT=` needed: the frozen base policy is committed at
+`checkpoints/stackcube_rgb_spatial_800demos.pt` and `run.sh` defaults to it, so
+this works on a fresh pod with nothing rsynced. Set `CKPT=...` to evaluate some
+other checkpoint — it always wins. Check the `visual encoder: spatial (8x8 map
+kept)` line in the output rather than the path; `harness.inspect_ckpt` infers
+the variant from the weights.
+
 | stage | what | cost |
 |---|---|---|
 | `test` | the two self-tests | ~3 s |
@@ -425,6 +432,9 @@ git: `bash setup/transfer.sh info`.
 | `run.sh` | the driver. `test \| index \| check \| eval \| verify \| report \| videos \| all` |
 | `test_geometry.py`, `test_verify.py` | the self-tests. No deps. |
 | `results/` | the committed evidence: the seed index and the 1,200-episode discovery pass. |
+
+The weights themselves are at `../checkpoints/` — committed, 33 MB, with the
+rationale in `checkpoints/README.md`.
 
 The narrative — what was tried, what was wrong first, and why the axes changed
 from `separation` to `face_gap` — is in

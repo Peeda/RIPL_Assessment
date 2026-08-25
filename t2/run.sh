@@ -86,33 +86,58 @@ on_exit() {
 trap on_exit EXIT
 
 # ---------------------------------------------------------------------------
-# The checkpoint is DERIVED, not pasted. t1/run_pipeline.sh builds the run
-# directory out of env id, obs mode, encoder variant and demo count, so the
-# path is a function of the run that produced it - and a pasted path is how you
-# end up reporting numbers from the pooled-encoder arm by accident.
+# Which weights. In order:
+#
+#   1. $CKPT, if set - always wins, for evaluating some other checkpoint.
+#   2. the copy committed in this repo - the default, so `bash t2/run.sh all`
+#      works on a fresh pod with no env var and no rsync from a pod that may
+#      no longer exist. This is the frozen base policy T-IV builds on, and
+#      pinning it in git is what makes every T-II and T-IV number attributable
+#      to the same weights.
+#   3. a live training run under $MANISKILL_REPO, so a freshly trained
+#      checkpoint is picked up without editing anything.
+#
+# 2 before 3 on purpose: the committed file is the one the reported numbers
+# came from. A local run that happens to share the directory name is a
+# DIFFERENT model, and silently preferring it is how a table ends up mixing
+# two policies.
 # ---------------------------------------------------------------------------
+REPO_CKPT=$ROOT/checkpoints/stackcube_rgb_spatial_800demos.pt
+
 find_ckpt() {
-  [ -n "${CKPT:-}" ] && return 0
+  if [ -n "${CKPT:-}" ]; then
+    echo "  ckpt        $CKPT  (from \$CKPT)"
+    return 0
+  fi
+  if [ -f "$REPO_CKPT" ]; then
+    export CKPT="$REPO_CKPT"
+    echo "  ckpt        $CKPT  (committed in-repo)"
+    return 0
+  fi
   local dp="${MANISKILL_REPO:?source env.sh first}/examples/baselines/diffusion_policy"
   local want="$dp/runs/diffusion_policy-$ENV_ID-rgb-${VARIANT:-spatial}-${NUM_DEMOS:-800}_motionplanning_demos-1/checkpoints/best_eval_success_once.pt"
-  if [ -f "$want" ]; then export CKPT="$want"; return 0; fi
-  echo "!! could not find the expected checkpoint:"
-  echo "     $want"
+  if [ -f "$want" ]; then
+    export CKPT="$want"
+    echo "  ckpt        $CKPT  (live training run)"
+    return 0
+  fi
+  echo "!! no checkpoint found."
+  echo "   expected in-repo:  $REPO_CKPT"
+  echo "   or a training run: $want"
   echo ""
-  echo "   Candidates on this pod:"
+  echo "   Candidates on this machine:"
   find "$dp/runs" -name "best_eval_success_once.pt" 2>/dev/null | sed 's/^/     /' || true
   echo ""
-  echo "   Set CKPT=... explicitly, or NUM_DEMOS/VARIANT if the run was named"
-  echo "   differently. The T-I deliverable and T-IV's frozen base is the"
-  echo "   SPATIAL encoder at 800 demos - not the pooled arm."
+  echo "   Set CKPT=... explicitly. The T-I deliverable and T-IV's frozen base"
+  echo "   is the SPATIAL encoder at 800 demos - not the pooled arm; inspect_ckpt"
+  echo "   prints which one it loaded, so check that line rather than the path."
   exit 1
 }
 
 do_preflight() {
   : "${MANISKILL_REPO:?source /workspace/ripl/env.sh first}"
   find_ckpt
-  echo "  CKPT        $CKPT"
-  echo "  OUT         $OUT"
+  echo "  out         $OUT"
   # patches/0001 makes pool_feature_map an Args field. On a stock checkout a
   # spatial checkpoint cannot be loaded at all, and the error surfaces deep
   # inside load_state_dict as a shape mismatch. Catch it here instead.
