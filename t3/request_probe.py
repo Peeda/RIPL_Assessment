@@ -1,25 +1,23 @@
 #!/usr/bin/env python
-"""Why did a generation come back as stubs? Bisect the request, one knob at a time.
+"""Why did a generation come back as stubs? Isolate the knob that kills thinking.
 
     python3 t3/request_probe.py --run t3/artifacts/gap          # free
-    python3 t3/request_probe.py --run t3/artifacts/gap --probe  # paid
+    python3 t3/request_probe.py --run t3/artifacts/gap --micro  # ~$0.02
+    python3 t3/request_probe.py --run t3/artifacts/gap --full   # ~one generation
 
-NOT NAMED bisect.py. Running `python3 t3/<name>.py` puts t3/ first on sys.path,
-so the file shadows any stdlib module of the same name for the whole process -
-and `random` imports `bisect`, so `import anthropic` died three frames into
-`email.utils`. Cost one round trip. Nothing in t3/ may take a stdlib name.
+TEMPORARY. Delete once the cause is in generate.py.
 
-TEMPORARY. Delete once the cause is found and the fix is in generate.py.
+NOT NAMED bisect.py. Running `python3 t3/<name>.py` puts t3/ first on sys.path
+for the whole process, so the file shadows any stdlib module of the same name -
+and `random` imports `bisect`, so `import anthropic` died inside email.utils.
+Nothing in t3/ may take a stdlib name.
 
-Step 0 costs nothing: it reads response_failed.json and reports whether the
-model thought at all, what it stopped on, and how long each field came back.
-`thinking` blocks absent means extra_body never reached the API, which is a
-different bug from the model choosing to stub.
-
-The probes replay the SAME prompt (blocks.json + system.txt, so this is not a
-new prompt being tested) with one knob changed each time, in decreasing order
-of suspicion, and STOP at the first variant that produces real content. Each
-one costs roughly one generation, so the ordering matters.
+WHY MICRO PROBES RATHER THAN REPLAYING THE PROMPT. The question is no longer
+"what does the model write" but "why are there zero thinking tokens", and that
+is answerable with a two-line prompt. Four tiny requests separate the knobs -
+tools at all, tool_choice forced, `strict` - for cents, where four replays of a
+25k-char prompt with ten images cost a generation each and confound the answer
+with what the model happened to sample.
 """
 import argparse
 import base64
@@ -33,70 +31,109 @@ sys.path.insert(0, HERE)
 from generate import (EXTRA_BODY, MAX_TOKENS, THINKING, TOOL,  # noqa: E402
                       _degenerate)
 
-FLOOR = 200          # chars of reward_py that count as "the model engaged"
+# Small, but genuinely needs a moment's arithmetic - a prompt with nothing to
+# think about produces zero thinking tokens for honest reasons and proves
+# nothing.
+MICRO = ("Two 40 mm cubes sit with their centres 62 mm apart. Both are rotated "
+         "45 degrees about the vertical axis. What is the clearance between "
+         "their nearest faces along the line joining the centres? Reason it "
+         "through, then give the number in mm.")
 
 
-def report(msg, label):
-    kinds = {}
-    for b in msg.content:
-        kinds[b.type] = kinds.get(b.type, 0) + 1
-    u = msg.usage
-    print(f"  {label}")
-    print(f"    blocks      {kinds}")
-    print(f"    stop        {msg.stop_reason}")
-    print(f"    usage       in {u.input_tokens} / out {u.output_tokens}"
-          f"  (cache r{getattr(u,'cache_read_input_tokens',0)} "
-          f"w{getattr(u,'cache_creation_input_tokens',0)})")
-    think = [b for b in msg.content if b.type == "thinking"]
-    print(f"    thinking    {'ABSENT - extra_body did not apply' if not think else str(sum(len(b.thinking) for b in think)) + ' chars'}")
-    tu = [b for b in msg.content if b.type == "tool_use"]
-    if not tu:
-        txt = "".join(b.text for b in msg.content if b.type == "text")
-        print(f"    no tool_use. text: {txt[:300]!r}")
-        return False
-    inp = tu[0].input
-    print(f"    fields      " + ", ".join(f"{k}={len(v) if isinstance(v,str) else v}"
-                                          for k, v in inp.items()))
-    return not _degenerate(inp)
+def load_key():
+    """run.sh sources $RIPL_ROOT/anthropic.env; running this file directly does
+    not, which is how four probes died on auth after paying nothing."""
+    if os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+        return "environment"
+    p = os.path.join(os.environ.get("RIPL_ROOT", "/workspace/ripl"), "anthropic.env")
+    if not os.path.exists(p):
+        sys.exit(f"\n!! no API key, and {p} does not exist.\n"
+                 f"   source it, or export ANTHROPIC_API_KEY.\n")
+    for line in open(p):
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[7:]
+        if "=" in line and not line.startswith("#"):
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        sys.exit(f"\n!! {p} did not define ANTHROPIC_API_KEY\n")
+    return p
+
+
+def thinking_tokens(msg):
+    d = getattr(msg.usage, "output_tokens_details", None)
+    n = getattr(d, "thinking_tokens", None) if d is not None else None
+    if n is None and isinstance(d, dict):
+        n = d.get("thinking_tokens")
+    return n if n is not None else sum(
+        len(getattr(b, "thinking", "")) for b in msg.content if b.type == "thinking")
 
 
 def offline(run, pick=None):
-    """The file matters: a stale response.json from an earlier run reads exactly
-    like a fresh failure. Print the name and the age of what was actually read.
-    """
     cands = [pick] if pick else ["response_failed.json", "response.json"]
     found = [(c, os.path.getmtime(os.path.join(run, c)))
              for c in cands if os.path.exists(os.path.join(run, c))]
     if not found:
-        sys.exit(f"no response.json or response_failed.json in {run}")
+        print(f"  (no response file in {run})")
+        return
     for c, m in sorted(found, key=lambda t: -t[1]):
         print(f"  present       {c}  ({time.strftime('%H:%M:%S', time.localtime(m))}, "
               f"{(time.time()-m)/60:.0f} min ago)")
-    p = os.path.join(run, found[0][0])
-    raw = json.load(open(p))
-    print(f"\n=== step 0: {os.path.basename(p)} (free) ===")
+    raw = json.load(open(os.path.join(run, found[0][0])))
+    print(f"\n=== step 0: {found[0][0]} (free) ===")
     kinds = {}
     for b in raw["content"]:
         kinds[b["type"]] = kinds.get(b["type"], 0) + 1
     print(f"  blocks        {kinds}")
     print(f"  stop_reason   {raw.get('stop_reason')}")
-    print(f"  usage         {raw.get('usage')}")
-    think = [b for b in raw["content"] if b["type"] == "thinking"]
-    print(f"  thinking      {'ABSENT - the request never enabled it' if not think else str(sum(len(b.get('thinking','')) for b in think)) + ' chars'}")
+    det = (raw.get("usage") or {}).get("output_tokens_details") or {}
+    print(f"  thinking      {det.get('thinking_tokens', 'not reported')} tokens")
     for b in raw["content"]:
         if b["type"] == "tool_use":
             print("  fields        " + ", ".join(
                 f"{k}={len(v) if isinstance(v,str) else v}" for k, v in b["input"].items()))
-    return bool(think)
+
+
+def micro(client):
+    """Four tiny requests. The only number that matters is thinking_tokens."""
+    nostrict = {k: v for k, v in TOOL.items() if k != "strict"}
+    forced = {"type": "tool", "name": TOOL["name"]}
+    cases = [
+        ("1  no tools at all       ", {}),
+        ("2  tools, choice=auto    ", dict(tools=[TOOL], tool_choice={"type": "auto"})),
+        ("3  tools, FORCED         ", dict(tools=[TOOL], tool_choice=forced)),
+        ("4  tools, FORCED, nostrict", dict(tools=[nostrict], tool_choice=forced)),
+    ]
+    print("\n=== micro probes: does `thinking` survive each knob? ===")
+    results = {}
+    for label, extra in cases:
+        kw = dict(model=os.environ.get("T3_MODEL", "claude-opus-5"),
+                  max_tokens=4000, thinking=THINKING,
+                  messages=[{"role": "user", "content": MICRO}], **extra)
+        try:
+            with client.messages.stream(**kw) as s:
+                msg = s.get_final_message()
+        except Exception as e:
+            print(f"  {label}  ERROR {type(e).__name__}: {str(e)[:200]}")
+            continue
+        t = thinking_tokens(msg)
+        results[label.strip()] = t
+        print(f"  {label}  thinking {t:>6}   out {msg.usage.output_tokens:>5}   "
+              f"stop {msg.stop_reason}")
+    if results:
+        print("\n  A row at 0 with rows above it non-zero names the knob that "
+              "suppresses thinking.")
+    return results
 
 
 def content(blocks, run):
     out = []
     for b in blocks:
         if b["type"] == "image":
-            path = b["path"] if os.path.isabs(b["path"]) else os.path.join(run, os.path.basename(os.path.dirname(b["path"])), os.path.basename(b["path"]))
+            path = b["path"]
             if not os.path.exists(path):
-                path = b["path"]
+                path = os.path.join(run, "frames", os.path.basename(path))
             with open(path, "rb") as f:
                 data = base64.standard_b64encode(f.read()).decode()
             out.append({"type": "image", "source": {"type": "base64",
@@ -109,62 +146,68 @@ def content(blocks, run):
     return out
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--run", required=True)
-    ap.add_argument("--probe", action="store_true", help="make paid API calls")
-    ap.add_argument("--file", help="read this response file rather than guessing")
-    ap.add_argument("--model", default=os.environ.get("T3_MODEL", "claude-opus-5"))
-    a = ap.parse_args()
-
-    had_thinking = offline(a.run, a.file)
-    if not a.probe:
-        print("\n  --probe to try request variants (each costs ~one generation).")
-        return
-
-    import anthropic
-    client = anthropic.Anthropic()
-    blocks = json.load(open(os.path.join(a.run, "blocks.json")))
-    system = open(os.path.join(a.run, "system.txt")).read()
-    full = content(blocks, a.run)
-    text_only = [b for b in full if b["type"] == "text"]
-
-    tool_nostrict = {k: v for k, v in TOOL.items() if k != "strict"}
+def full(client, run, model):
+    blocks = json.load(open(os.path.join(run, "blocks.json")))
+    system = open(os.path.join(run, "system.txt")).read()
+    body = content(blocks, run)
+    nostrict = {k: v for k, v in TOOL.items() if k != "strict"}
     forced = {"type": "tool", "name": TOOL["name"]}
-
     variants = [
-        ("A no-strict     ", dict(tools=[tool_nostrict], tool_choice=forced,
-                                  extra_body=EXTRA_BODY, content=full)),
-        ("B tool_choice=auto", dict(tools=[TOOL], tool_choice={"type": "auto"},
-                                    extra_body=EXTRA_BODY, content=full)),
-        ("C no extra_body ", dict(tools=[TOOL], tool_choice=forced,
-                                  extra_body=None, content=full)),
-        ("D no images     ", dict(tools=[TOOL], tool_choice=forced,
-                                  extra_body=EXTRA_BODY, content=text_only)),
+        ("auto", dict(tools=[TOOL], tool_choice={"type": "auto"})),
+        ("nostrict", dict(tools=[nostrict], tool_choice=forced)),
+        ("noextra", dict(tools=[TOOL], tool_choice=forced, _noextra=True)),
     ]
-
-    for label, v in variants:
-        print(f"\n=== probe {label.strip()} ===")
-        kw = dict(model=a.model, max_tokens=MAX_TOKENS, system=system,
-                  messages=[{"role": "user", "content": v["content"]}],
-                  tools=v["tools"], tool_choice=v["tool_choice"],
-                  thinking=THINKING)
-        if v["extra_body"]:
-            kw["extra_body"] = v["extra_body"]
+    for name, v in variants:
+        print(f"\n=== full probe: {name} ===")
+        kw = dict(model=model, max_tokens=MAX_TOKENS, system=system,
+                  messages=[{"role": "user", "content": body}],
+                  thinking=THINKING,
+                  tools=v["tools"], tool_choice=v["tool_choice"])
+        if not v.get("_noextra"):
+            kw["extra_body"] = EXTRA_BODY
         try:
             with client.messages.stream(**kw) as s:
                 msg = s.get_final_message()
         except Exception as e:
-            print(f"    ERROR  {type(e).__name__}: {str(e)[:400]}")
+            print(f"  ERROR {type(e).__name__}: {str(e)[:300]}")
             continue
-        good = report(msg, label.strip())
-        with open(os.path.join(a.run, f"bisect_{label.split()[0]}.json"), "w") as f:
+        tu = [b for b in msg.content if b.type == "tool_use"]
+        print(f"  thinking {thinking_tokens(msg)}   out {msg.usage.output_tokens}   "
+              f"stop {msg.stop_reason}")
+        if tu:
+            print("  fields   " + ", ".join(
+                f"{k}={len(x) if isinstance(x,str) else x}" for k, x in tu[0].input.items()))
+        with open(os.path.join(run, f"probe_{name}.json"), "w") as f:
             f.write(msg.to_json())
-        if good:
-            print(f"\n  >> {label.strip()} PRODUCED REAL CONTENT. That knob is the cause.")
-            print(f"     saved: {a.run}/bisect_{label.split()[0]}.json")
+        if tu and not _degenerate(tu[0].input):
+            print(f"\n  >> '{name}' PRODUCED REAL CONTENT - that knob is the cause.")
+            print(f"     saved {run}/probe_{name}.json")
             return
-    print("\n  no variant produced real content - the cause is not in these four.")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--run", required=True)
+    ap.add_argument("--file")
+    ap.add_argument("--micro", action="store_true", help="four tiny paid requests")
+    ap.add_argument("--full", action="store_true", help="replay the real prompt")
+    ap.add_argument("--model", default=os.environ.get("T3_MODEL", "claude-opus-5"))
+    a = ap.parse_args()
+
+    offline(a.run, a.file)
+    if not (a.micro or a.full):
+        print("\n  --micro to isolate the knob (~$0.02), --full to replay the prompt.")
+        return
+
+    src = load_key()
+    print(f"\n  api key from {src} (...{os.environ['ANTHROPIC_API_KEY'][-4:]})")
+    import anthropic
+    print(f"  anthropic    {anthropic.__version__}")
+    client = anthropic.Anthropic()
+    if a.micro:
+        micro(client)
+    if a.full:
+        full(client, a.run, a.model)
 
 
 if __name__ == "__main__":
