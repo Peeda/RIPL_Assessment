@@ -17,8 +17,7 @@ configurations are the ones where both cubes are turned toward each other
 corner-first — the region is as much a statement about **yaw** as about
 proximity.
 
-**What the policy does.** It reaches and grasps the red cube about as reliably
-as it does anywhere else. Grasping is not the problem. What collapses is getting
+**What the policy does.** What collapses is getting
 the red cube onto the green one: a large share of these episodes end with the
 red cube grasped, or dropped, but never placed.
 
