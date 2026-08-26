@@ -1,17 +1,31 @@
 #!/usr/bin/env python
-"""t4/residual.py against hand-computed cases. torch + stdlib, ~2 s, no sim.
+"""t4/ against hand-computed cases. torch + stdlib, ~3 s, NO SIMULATOR.
 
 The layer this covers - the bound, the gripper exclusion, the passthrough, the
-base's re-planning rate - is the layer where being wrong is both most expensive
-and least visible: every one of these would produce a plausible CSV.
+base's re-planning rate, the sim-state round trip, the T-IV verifier - is the
+layer where being wrong is both most expensive and least visible: every one of
+these would produce a plausible CSV rather than an error.
 
-    python3 t4/test_t4.py
+It needs torch, which the base policy's own definition makes unavoidable. On
+the pod the venv has it. On this NixOS laptop the system interpreter does not,
+so (see CLAUDE.md's nix-shell note):
+
+    nix-shell -p "python3.withPackages(ps: [ps.torch ps.numpy])" \
+      --run "python3 t4/test_t4.py"
+
+t2/test_geometry.py and t2/test_verify.py remain bare-interpreter; the T-IV
+things that could be are in t4/verify_t4.py, which imports stdlib only.
 """
 import os
 import sys
 import tempfile
 
-import torch
+try:
+    import torch
+except ModuleNotFoundError:
+    sys.exit("\nt4/test_t4.py needs torch. On the laptop:\n"
+             "    nix-shell -p \"python3.withPackages(ps: [ps.torch ps.numpy])\" \\\n"
+             "      --run \"python3 t4/test_t4.py\"\n")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from residual import (ACT_DIM, RES_DIM, ResidualAgent, ResidualHead,  # noqa: E402
@@ -402,5 +416,119 @@ try:
     ok(False, "a malformed state name must raise")
 except ValueError:
     ok(True, "a malformed state name raises rather than guessing")
+
+
+
+# ---------------------------------------------------------------------------
+# 13. verify_t4.py catches things
+#
+# Same discipline as t2/test_verify.py: fabricate a VALID before/after pair,
+# then corrupt it one way at a time and require each corruption to be caught.
+# A checker nobody has broken on purpose is a checker nobody knows works.
+# ---------------------------------------------------------------------------
+
+import csv as _csv  # noqa: E402
+import json as _json  # noqa: E402
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
+
+T4 = os.path.dirname(os.path.abspath(__file__))
+COLS = ["run_id", "mode", "block", "policy_seed", "seed",
+        "cubeA_x", "cubeA_y", "cubeA_theta", "cubeB_x", "cubeB_y", "cubeB_theta",
+        "separation", "relative_yaw", "relative_yaw_mod90",
+        "face_gap", "dist_A", "dist_B", "dist_max", "dist_min",
+        "success_once", "success_at_end", "ep_len",
+        "ever_grasped", "ever_placed", "ever_static",
+        "final_cubeA_x", "final_cubeA_y", "final_cubeA_z", "cubeB_displacement"]
+
+
+def _pass(d, modes=("nominal", "gap"), n=10, residual=False, **over):
+    os.makedirs(d, exist_ok=True)
+    for mode in modes:
+        for b in (1, 2, 3):
+            stem = os.path.join(d, f"mode_{mode}_seed{b}")
+            with open(stem + ".csv", "w", newline="") as f:
+                w = _csv.DictWriter(f, fieldnames=COLS)
+                w.writeheader()
+                for i in range(n):
+                    row = {c: 0 for c in COLS}
+                    row.update(run_id=f"mode_{mode}_seed{b}", mode=mode, block=b,
+                               policy_seed=b, seed=10000 + b * 1000 + i,
+                               success_once=i % 2, success_at_end=i % 2,
+                               ep_len=200, ever_grasped=1, ever_placed=i % 2,
+                               ever_static=1)
+                    w.writerow(row)
+            man = dict(ckpt_sha256="b6195b5a7d72c396", mode=mode, block=b,
+                       policy_seed=b, episodes=n)
+            if residual:
+                man.update(residual=f"/r/residual_seed{b}.pt",
+                           residual_sha256=f"aaaaaaaaaaaaaaa{b}",
+                           residual_seed=b, residual_mode=mode,
+                           residual_alpha=0.05, residual_res_horizon=8)
+            man.update(over.get((mode, b), {}))
+            _json.dump(man, open(stem + "_manifest.json", "w"))
+    return d
+
+
+def _run(before, after):
+    r = subprocess.run([sys.executable, os.path.join(T4, "verify_t4.py"),
+                        before, after], capture_output=True, text=True)
+    return r.returncode
+
+
+with tempfile.TemporaryDirectory() as td:
+    B, A = os.path.join(td, "before"), os.path.join(td, "after")
+    _pass(B)
+    _pass(A, residual=True)
+    ok(_run(B, A) == 0, "a valid before/after pair passes")
+
+    def corrupt(fn, why):
+        A2 = os.path.join(td, "c")
+        shutil.rmtree(A2, ignore_errors=True)
+        shutil.copytree(A, A2)
+        fn(A2)
+        ok(_run(B, A2) == 1, why)
+
+    def unpair(d):
+        p = os.path.join(d, "mode_gap_seed2.csv")
+        rows = list(_csv.DictReader(open(p)))
+        rows[0]["seed"] = "999999"
+        with open(p, "w", newline="") as f:
+            w = _csv.DictWriter(f, fieldnames=COLS); w.writeheader(); w.writerows(rows)
+    corrupt(unpair, "a seed that differs from the before pass is caught")
+
+    def rehash(d):
+        q = os.path.join(d, "mode_gap_seed1_manifest.json")
+        m = _json.load(open(q)); m["ckpt_sha256"] = "0000000000000000"
+        _json.dump(m, open(q, "w"))
+    corrupt(rehash, "a different frozen base between passes is caught")
+
+    def strip(d):
+        q = os.path.join(d, "mode_nominal_seed3_manifest.json")
+        m = _json.load(open(q))
+        for k in list(m):
+            if k.startswith("residual"):
+                del m[k]
+        _json.dump(m, open(q, "w"))
+    corrupt(strip, "an after block with no residual is caught")
+
+    def mispair(d):
+        q = os.path.join(d, "mode_gap_seed3_manifest.json")
+        m = _json.load(open(q)); m["residual_seed"] = 1
+        _json.dump(m, open(q, "w"))
+    corrupt(mispair, "residual seed 1 evaluated in block 3 is caught")
+
+    def one_run(d):
+        for b in (2, 3):
+            q = os.path.join(d, f"mode_gap_seed{b}_manifest.json")
+            m = _json.load(open(q)); m["residual_sha256"] = "aaaaaaaaaaaaaaa1"
+            _json.dump(m, open(q, "w"))
+    corrupt(one_run, "one residual copied across three blocks is caught")
+
+    def nosha(d):
+        q = os.path.join(d, "mode_gap_seed1_manifest.json")
+        m = _json.load(open(q)); del m["residual_sha256"]
+        _json.dump(m, open(q, "w"))
+    corrupt(nosha, "a residual with no hash is caught")
 
 print(f"\n{N} assertions passed.")
