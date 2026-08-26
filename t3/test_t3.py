@@ -185,6 +185,25 @@ def sample_cube_poses(b, device):
 """
 
 
+def test_free_names():
+    """A name resolvable only from builtins is checkable statically, for free.
+
+    This is the check that would have caught the missing `dict` before nine
+    minutes of generation and a pod round trip, rather than after.
+    """
+    bad = ("import torch\n"
+           "def sample_cube_poses(b, device):\n"
+           "    return {'x': zeros(b)}\n")
+    e, _ = check_static(bad, "sampler")
+    check(any("'zeros'" in x for x in e), "undefined name is an error", str(e))
+    ok = ("import torch\n"
+          "def sample_cube_poses(b, device):\n"
+          "    n = b\n"
+          "    return {k: torch.zeros(n) for k in ('a',)}\n")
+    e, _ = check_static(ok, "sampler")
+    check(not e, "locals and comprehension targets are not free names", str(e))
+
+
 def test_sandbox_builtins():
     """Generated code must be able to call the ordinary builtins."""
     ns = load_source(BUILTINS_PROBE, "sampler", "builtins_probe.py")
@@ -196,7 +215,7 @@ def test_sandbox_builtins():
 
 def main():
     for t in (test_fixtures_load, test_errors, test_warnings_still_load,
-              test_sandbox_builtins, test_auc):
+              test_free_names, test_sandbox_builtins, test_auc):
         t()
     if not HAVE_TORCH:
         print("\n  (no torch here - check_static was tested, the "

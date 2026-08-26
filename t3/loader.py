@@ -170,6 +170,41 @@ def check_static(source, kind, name="<generated>"):
                 else:
                     warnings.append(f"line {ln}: info[...] with a non-literal key")
 
+    # --- names that would NameError at call time ---------------------------
+    # THE CHECK THAT WOULD HAVE SAVED A 46,463-TOKEN GENERATION. `dict` was
+    # missing from SAFE_BUILTINS, so a sampler ending `return dict(...)` passed
+    # every static rule and died on its own return statement, on the pod, after
+    # nine minutes of generation. A free name is resolvable only from builtins,
+    # so it is checkable here for nothing.
+    #
+    # Bound names are OVER-approximated - every Store anywhere in the module,
+    # regardless of scope - because a false positive here rejects working code,
+    # which is the failure this whole file was loosened to avoid.
+    bound = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bound.add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+            fa = getattr(node, "args", None)
+            if fa:
+                for x in list(fa.args) + list(fa.posonlyargs) + list(fa.kwonlyargs):
+                    bound.add(x.arg)
+                for x in (fa.vararg, fa.kwarg):
+                    if x:
+                        bound.add(x.arg)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for al in node.names:
+                bound.add((al.asname or al.name).split(".")[0])
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bound.add(node.name)
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+                and node.id not in bound and node.id not in SAFE_BUILTINS):
+            errors.append(f"line {getattr(node, 'lineno', '?')}: name "
+                          f"'{node.id}' is neither defined nor available in the "
+                          f"sandbox - it would NameError when called")
+
     # --- required functions, exact parameter names, in order ---------------
     defs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
     for fname, params in required.items():
