@@ -64,6 +64,11 @@ RES_HORIZON=${RES_HORIZON:-0}
 # physx_cpu vectorises by SUBPROCESS, so this is a process count, not a batch
 # width. It buys nothing above the core count.
 NUM_ENVS=${NUM_ENVS:-16}
+# `smoke` is separate from $NUM_ENVS so the end-to-end check stays cheap, but it
+# is a knob because the ONLY honest way to size $TOTAL_STEPS is to measure the
+# rate at the width you will train at.
+SMOKE_ENVS=${SMOKE_ENVS:-4}
+MAX_EP_STEPS=${MAX_EP_STEPS:-200}
 TRAIN_BACKEND=${TRAIN_BACKEND:-physx_cpu}
 TOTAL_STEPS=${TOTAL_STEPS:-1000000}
 ALPHA_WARMUP=${ALPHA_WARMUP:-250000}
@@ -158,12 +163,24 @@ do_backend() {
 }
 
 do_smoke() {
-  stage "smoke - one tiny PPO iteration, end to end"
+  stage "smoke - three tiny PPO iterations, end to end, at \$SMOKE_ENVS=$SMOKE_ENVS"
   find_ckpt
   rm -rf "$RUNS/smoke"
+  # One iteration is one episode per env, so it is $MAX_EP_STEPS env steps per
+  # env WHATEVER $RES_HORIZON is. Three of them, so the printed rate is not
+  # dominated by the first iteration's warm-up.
+  local total=$(( SMOKE_ENVS * MAX_EP_STEPS * 3 ))
   python "$HERE/train_ppo.py" --mode "$MODE" --seed 99 --ckpt "$CKPT" \
-    --out "$RUNS/smoke" --num-envs 4 --total-timesteps 6400 \
-    --alpha "$ALPHA" --alpha-warmup 3200 --num-minibatches 2 --update-epochs 1
+    --out "$RUNS/smoke" --num-envs "$SMOKE_ENVS" --total-timesteps "$total" \
+    --sim-backend "$TRAIN_BACKEND" --res-horizon "$RES_HORIZON" \
+    --alpha "$ALPHA" --alpha-warmup $(( total / 2 )) \
+    --num-minibatches 2 --update-epochs 1
+  echo ""
+  echo "  env-step/s above is the AGGREGATE over all $SMOKE_ENVS processes -"
+  echo "  global_step counts num_envs per sub-step - so do NOT multiply it by"
+  echo "  the process count again. Divide \$TOTAL_STEPS by it to size the run,"
+  echo "  and re-measure at the \$NUM_ENVS you actually intend to train at:"
+  echo "  physx_cpu scales by subprocess and the rate is sublinear in it."
   echo "  smoke output is in $RUNS/smoke and is NOT a result; delete it freely."
 }
 
