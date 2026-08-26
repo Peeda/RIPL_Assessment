@@ -572,6 +572,9 @@ Inside this repo, one directory per assignment task (see The scripts, below):
 setup/    pod build, patching, transfer, smoke gates
 t1/       run_pipeline.sh - data replay + both training runs
 t2/       run.sh, the failure-mode evaluation - see t2/README.md
+t3/       run.sh, the LLM pipeline - see t3/README.md
+          t3/artifacts/ holds the GENERATED reward + sampler, gen1 and gen2
+t4/       run.sh, the Policy Decorator residual - see t4/README.md
 patches/  patches applied to the ManiSkill checkout
 notes/    debugging narratives; report material, not overhead
 figures/  report.py's output, committed
@@ -642,6 +645,30 @@ the measurements back.
 | `report.py` | Two figures. |
 | `test_t3.py` | The contract and the checker. No deps, ~1 s. |
 | `run.sh` | The one driver. `test | prompt | generate | lint | check | calibrate | summary | report | all`. |
+
+### `t4/` — the residual
+
+**Read `t4/README.md` first.** Same layering again: a torch-only core that
+defines what the residual IS, a sim half, and a stdlib half that reads the
+measurements back.
+
+| | |
+|---|---|
+| `residual.py` | The head, the alpha bound, the alpha ramp, `ResidualAgent`, the checkpoint format. **torch only** — 193 assertions run on the laptop. |
+| `env_t4.py` | `@register_env("StackCube-T4-v1")`. T-III's env plus `T4_NOMINAL_FRAC`. |
+| `make_envs.py` | The GPU training env. Wrapper order copied from the DP baseline's GPU branch, not invented. |
+| `train_ppo.py` | PPO, adapted from `examples/baselines/ppo/ppo.py`. The chunked MDP. |
+| `capture_states.py` | physx_cpu initial states of the nominal blocks. No policy, minutes. |
+| `backend_check.py` | Recovered from `c1c010b^`. **The GPU/CPU licence.** |
+| `simstate.py` | flatten/unflatten a ManiSkill sim state, once, shared by both. |
+| `verify_t4.py` | Pairing and residual provenance. **Stdlib.** Exits non-zero. |
+| `report.py` | Two figures, the before/after table, the wall-clock/VRAM table. |
+| `test_t4.py` | 193 assertions, no simulator. Needs torch. |
+| `run.sh` | The one driver. `test \| capture \| backend \| smoke \| train \| eval \| verify \| report \| all`. |
+
+`t4/run.sh eval` reuses `t2/eval_modes.py` unchanged — it only sets `T2_OUT`,
+`RESIDUAL` and `BACKEND`. **That is the design**: the after pass is the same
+measurement as the before pass, not a parallel one.
 
 **`summary.py` is a separate file from `check.py` on purpose.** `check.py` must
 `import env_t3` at module scope so the forkserver workers register the
@@ -944,31 +971,62 @@ is load-bearing and Blackwell cards already have an open ManiSkill issue.
   found and removed in the process: region selection reached into T-I's seed
   block, and the index was too small for `farb` to fill. See the T-II harness
   section.
-- **T-III's pipeline and sampler are implemented and self-tested; no
-  generation has been run yet.** `t3/` mirrors `t2/`'s shape: a stdlib contract
-  (`spec.py`) rendered into the prompt AND read by the checker, three
-  measurements that write files, and a summary that reads them back. Self-tests
-  pass on the laptop with the bare interpreter (`python3 t3/test_t3.py`, 30
-  assertions). What is *not* done: no mp4 exists in the repo (they are
-  gitignored), so no prompt has been assembled against real frames and no API
-  call has been made. Method in `t3/README.md`.
+- **T-III has run.** `t3/` mirrors `t2/`'s shape: a stdlib contract (`spec.py`)
+  rendered into the prompt AND read by the checker, three measurements that
+  write files, and a summary that reads them back. Self-tests pass on the
+  laptop with the bare interpreter (`python3 t3/test_t3.py`, 35 assertions).
+  Four generations were made against real frames and are committed — see the
+  next bullet. What is *not* in the repo: the mp4s themselves (gitignored,
+  though the extracted frames each prompt used are committed beside it), and
+  `check.py`'s measurement outputs, which were never pulled off the pod. The
+  only surviving T-III numbers are the four figures in `figures/` and the
+  tables here. Method in `t3/README.md`.
 - **`t3/` was cut from ~4,850 lines to ~2,750** after the checking outgrew the
   thing it was checking. The gate, the probe battery and the gate's own test
   suite are gone; thresholds now print WARN and exit 0. See the T-III section
   for what that costs.
+- **T-III's generated artifacts are now IN GIT, at `t3/artifacts/`.** They were
+  under `checkpoints/`, which `.gitignore`'s `checkpoints/*` swallows whole, so
+  the entire T-III output was untracked. Four generations are committed —
+  `gap`, `farb` (gen1) and `gap_gen2`, `farb_gen2` — because the difference
+  between them IS the "manual effort to elicit desired results" deliverable.
+  Independently re-measured here, 4096 draws under `torch.manual_seed(0)`:
+
+  | run | hit rate | nominal base | enrichment | sd(x)/sd(y) |
+  |---|--:|--:|--:|---|
+  | `gap` | 0.969 | 0.0468 | 20.7x | 0.064 / 0.089 |
+  | **`gap_gen2`** | 0.897 | 0.0468 | 19.2x | **0.081 / 0.130** |
+  | `farb` | **0.133** | 0.0337 | 4.0x | 0.071 / 0.149 |
+  | **`farb_gen2`** | **0.996** | 0.0337 | 29.5x | 0.078 / 0.171 |
+
+  **T-IV trains on gen2 for both modes.** gen1 `farb` cannot hit its own region
+  by arithmetic (`rB ~ U(0.695, 0.775)` against `dist_B >= 0.76`, a 0.1875
+  ceiling); gen2 starts at 0.78. gen1 `gap` hits MORE often and is still worse —
+  gen2's xy spread is ~40% wider, so it covers the region rather than one
+  corner. A hit rate near 1.0 with no spread is the degenerate sampler
+  `spec.SAMPLER_SD_MIN_XY` exists to catch.
+- **T-IV is implemented and self-tested; nothing has been trained yet.** `t4/`
+  mirrors `t2/`/`t3/`'s layering: a torch-only `residual.py`, a sim half, and a
+  stdlib `verify_t4.py`. 193 assertions pass on the laptop
+  (`nix-shell -p "python3.withPackages(ps: [ps.torch ps.numpy])"`), and
+  `t2/verify.py` still exits 0 on `t2/results` with `test_geometry.py` still at
+  303 — the seam did not disturb the committed T-II evidence. What is NOT done:
+  no backend check has run, no PPO has run, no residual exists. Method in
+  `t4/README.md`.
 - **Next, in order:**
   1. `bash setup/apply_patches.sh` on the pod (after `setup_runpod.sh`, which
      re-clones ManiSkill and wipes the patch).
   2. `SEEDS=... WANT=fail bash t2/run.sh videos` — pick failing seeds from
      `mode_gap_seed1.csv` and `mode_farb_seed1.csv`. mp4s are a T-II
-     deliverable AND T-III's only input; nothing in `t3/` runs without one.
+     deliverable AND T-III's only input.
   3. `bash t2/run.sh report` — the T-II figures, now that the eval is done.
-  4. `MODE=gap VIDEO=<clip>.mp4 bash t3/run.sh all`, then the same for `farb`.
-     `summary` exits 0 even with WARNs — **read them before using the reward for
-     T-IV**, and put them in the report either way.
-  5. Then T-IV: the residual seam in `t2/harness.build_agent`. See "Reusing this
-     harness for T-IV" below for what transfers and what does not.
-  6. Pull before stopping the pod: `bash setup/transfer.sh info`. Figures do
+  4. `bash t4/run.sh backend` — **the gate.** Licenses training on GPU while
+     scoring on CPU. Run it BEFORE spending GPU hours.
+  5. `MODE=gap bash t4/run.sh smoke`, then `train`, `eval`, `verify`. Then the
+     same for `farb`. Then `bash t4/run.sh report`.
+  6. If the nominal arm degrades by more than ~3 points, rerun that mode at
+     `T4_NOMINAL_FRAC=0.5` and report both as the mixing ablation.
+  7. Pull before stopping the pod: `bash setup/transfer.sh info`. Figures do
      **not** come back by git; the pod never pushes.
 
 ---
@@ -1471,18 +1529,27 @@ identical shape, which is where T-IV's "near-zero degradation on the nominal
 distribution" number comes from — it is already being measured, not a separate
 job.
 
-**Does not transfer: `harness.build_agent`.** It constructs a stock diffusion
-policy `T.Agent(envs, args)` and does a strict `load_state_dict`
-(`harness.py:127`), so a residual checkpoint — frozen base plus a PPO-trained
-head — fails on unexpected keys. `inspect_ckpt` rejects it earlier still if the
-top-level layout is not `ema_agent`/`agent`. This is a loud `RuntimeError`, not
-a silently wrong number, but it does mean T-IV must add a seam: a wrapper that
-holds the frozen base agent and applies `a = a_base + clip(Δ, −α, α)` to the
-three translation dims, selected by what the checkpoint actually contains.
-**Both arms must go through that one path**, or the before/after compares two
-code paths as well as two policies.
+**The seam, now built.** `harness.build_agent` **always** returns a
+`t4.residual.ResidualAgent`, even with no residual — CLAUDE.md's rule that both
+arms go through one path, made structural. With `head=None` the wrapper adds no
+tensor operation and returns the base's own chunk, so the before arm is
+bit-identical to what every committed T-II number was measured on.
 
-**Two operational traps when running the after-pass:**
+**The residual is a SEPARATE file behind `$RESIDUAL`, never merged into the
+base state dict.** That is what avoided relaxing anything: `inspect_ckpt` still
+requires `ema_agent`/`agent`, `load_weights` is still strict, and `verify.py`
+check 5 ("exactly one `ckpt_sha256` per pass") still means what it meant,
+because `CKPT` is still the frozen base. A merged checkpoint would have needed
+all three loosened, and check 5 would have stopped being a check.
+
+`$RESIDUAL` may contain `{block}`: T-IV pairs residual seed *b* with evaluation
+block *b*, because otherwise the three-block spread measures only DDPM sampling
+noise on fixed initial states and leaves TRAINING variance — the dominant term
+— unmeasured. `t4/verify_t4.py` enforces the pairing and that the three heads
+actually differ.
+
+**Two operational traps when running the after-pass** (`t4/run.sh eval` handles
+both; they are recorded here because doing it by hand does not):
 
 - **Use a different `T2_OUT`.** `eval_modes.py` refuses to overwrite a finished
   block, on purpose — rollouts are stochastic and anything clobbered is gone.
@@ -1494,8 +1561,13 @@ code paths as well as two policies.
   `INDEX_SEEDS` selects different seeds and the comparison stops being paired.
 
 ```bash
-mkdir -p $RIPL_ROOT/t2_after && cp $RIPL_ROOT/t2/seeds.csv $RIPL_ROOT/t2_after/
-T2_OUT=$RIPL_ROOT/t2_after CKPT=/path/to/residual.pt bash t2/run.sh eval
+MODE=gap bash t4/run.sh eval     # does exactly this, with the right CKPT
+# by hand:
+mkdir -p $RIPL_ROOT/t4_after_gap
+cp t2/results/seeds.csv $RIPL_ROOT/t4_after_gap/
+T2_OUT=$RIPL_ROOT/t4_after_gap \
+RESIDUAL=$RIPL_ROOT/t4/runs/gap/residual_seed{block}.pt \
+  bash t2/run.sh eval           # CKPT stays the FROZEN BASE, not the residual
 ```
 
 **Videos are a fresh draw, not a replay.** `record_seeds.py` re-runs the seed
@@ -1505,6 +1577,127 @@ depends on batch width — eval runs 10 wide, recording runs 1 wide. Caption
 every clip "an episode from this initial state", never "the episode from the
 table". `--want fail` retries until the outcome matches and logs the hit rate
 to `attempts.csv` so the retrying is visible rather than hidden.
+
+---
+
+## T-IV — the Policy Decorator residual
+
+**`t4/README.md` is the method walkthrough.** This section holds only what
+would otherwise be relitigated.
+
+### The MDP is chunked, and it has to be
+
+The base emits `act_horizon=8` actions per call and every rollout loop executes
+all 8 open-loop. PPO is per-step. **One PPO timestep = one base call = 8 env
+steps**: state is the base's embedding at the replan boundary, action is
+`res_horizon * 3` raw Gaussian, reward is the MEAN of the 8 per-step
+`normalized_dense` rewards, an episode is exactly `200/8 = 25` steps, and
+**`gamma` is per chunk** — 0.9 here is ≈0.987 per env step, which is why it is
+not upstream `ppo.py`'s 0.8.
+
+A per-step MDP is not merely expensive, it is **not well defined without
+changing the base policy**: one action per observation means re-running the
+DDPM every step and keeping its first action, which re-plans 8× more often and
+is a different policy. T-I's 0.730 and T-II's 0.513 / 0.623 would stop
+describing the "before" arm. Do not "simplify" this back.
+
+Mean rather than sum over sub-steps is a units choice — constant chunk length,
+so they differ by exactly `act_horizon` — but the loop divides by the steps
+*actually* executed, because a silent partial chunk is a units bug, not a
+crash.
+
+### PD's progressive exploration schedule CANNOT be ported to PPO
+
+Policy Decorator Sec 4.2 executes `pi_base` with probability `1−eps` and
+`pi_base + pi_res` with probability `eps`. **That behaviour policy is a mixture
+of a Dirac and a Gaussian: its density is undefined, so PPO cannot form an
+importance ratio for it.** Free for SAC, which reads actions out of a replay
+buffer; unusable here.
+
+Keeping their Bernoulli mask would not crash. It would put a large population
+of `Δ = 0` actions into the batch scored under the Gaussian's density, worst
+exactly early in training when `eps` is small.
+
+**`residual.alpha_at` ramps the BOUND instead**: `alpha_t = alpha * min(t/H, 1)`.
+Same effect, exact log-probs — α does not enter the log-prob at all, since the
+raw Gaussian sample IS the action and `alpha*tanh` is part of the transition.
+What would break if α moved mid-iteration is the MDP, not the ratio, so α is
+computed once per iteration and held across collect+update. **Do not "restore"
+the eps schedule.**
+
+### The gripper dimension is excluded from the head, not masked after it
+
+The head emits `res_horizon * 3`. No fourth output row, no `log_std` entry, no
+sampled dimension. Emitting 4 and zeroing the last would leave inert
+coordinates inside `log_prob.sum(-1)`, `entropy()` and `approx_kl` — PPO
+integrating noise over dimensions that provably cannot move the simulator.
+
+The residual therefore cannot change the gripper COMMAND, but does change its
+TIMING: the base is closed-loop, so moving the end effector changes the
+observation its next chunk is conditioned on. **Both gen2 rewards pay
+explicitly for gripper opening** (`open_frac`, `ungrasp`), so part of the
+reward's gradient sits on a channel the residual does not control. Not fatal —
+the reward still ranks states correctly — but report it rather than let it be
+rediscovered.
+
+### `RES_HORIZON` decouples the residual's rate from the base's
+
+Default 8 (PD's shape). Smaller re-queries the residual against a **fresh**
+embedding every 4 or 2 env steps while `ResidualAgent._pending` keeps the
+frozen base consulted exactly once per 8. Costs one CNN forward, no U-Net.
+`get_action` then returns `res_horizon` steps and every caller already sizes
+itself off `chunk.shape[1]` — which is why `reset_chunk()` now appears at every
+env reset in `eval_modes.py`, `record_seeds.py` and `t3/check.py`.
+
+### alpha is a bound in metres
+
+`pd_ee_delta_pos` maps ±1 to ±0.1 m, so **α = 0.05 is 5 mm per step**. It
+bounds the PER-STEP delta over ~200 steps, so a persistent correction
+accumulates; the binding limit is the IK saturating, which is why
+`MODES["farb"]` carries `dist_A < 0.72`. `charts/delta_norm_mm` is plotted
+against `charts/alpha_mm` so saturation is visible rather than inferred. Tune α
+on TRAINING success, never on the eval set.
+
+### Train on GPU, score on CPU, and run `backend_check.py` first
+
+physx_cpu measured ~28 env-steps/s, so 4M steps is ~40 h per residual. But a
+seed does not address an episode on physx_cuda and the assert that should catch
+that passes and lies. `t4/backend_check.py` (recovered from `c1c010b^`)
+sidesteps seeds entirely: `capture_states.py` reads the exact CPU initial
+states of the 300 committed nominal episodes, and the check replays them on GPU
+through `reset_to_env_states`.
+
+**The verdict is not agreement == 1.0** — DDPM sampling means identical states
+disagree even CPU-vs-CPU, floor ~0.74. What matters is whether GPU lands at the
+floor, whether McNemar shows a direction, and above all whether the
+**conditional** table over `face_gap`/`dist_max` moves. The marginal agreeing
+while the failure region shifts is the outcome that invalidates T-IV, and only
+that table catches it.
+
+### The training distribution, and `T4_NOMINAL_FRAC`
+
+`T3_SAMPLER=1` puts ~90–99% of training episodes in the region against a 3–5%
+base rate. **The residual then fires on every state at evaluation**, including
+the ~95% of nominal episodes that look nothing like training — which is the
+mechanism by which a targeted finetune degrades general performance. PD's only
+defence is the bounded residual.
+
+`T4_NOMINAL_FRAC` defaults to **0.0**, because "the episodic configuration from
+T-III" is what the assignment specifies, and at 0 the blending branch is not
+entered. Raise it to 0.5 only if the nominal arm actually degrades, and report
+BOTH runs — the comparison is a result either way.
+
+**Training uses no seeds at all.** With the sampler on, `reset(seed=s)` does
+not produce `seeds.csv`'s state for `s`; the training distribution is
+continuous and shares no episode with the 900 evaluation seeds. The overlap is
+distributional, which is the point.
+
+### "3 seeds" means three trained residuals, paired to the three blocks
+
+T-I and T-II read it as three blocks of 100 under three policy seeds. For T-IV
+that would leave TRAINING variance — the dominant term — unmeasured. So three
+residuals per mode, seed *b* evaluated on block *b*. Evaluation cost is
+unchanged (9 blocks per mode either way); only GPU training triples.
 
 ### A correction to this file
 
