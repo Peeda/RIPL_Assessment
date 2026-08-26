@@ -20,6 +20,13 @@ import gymnasium as gym
 import numpy as np
 import torch
 
+# t4/residual.py imports torch and nothing else, so this costs nothing and is
+# safe off-pod. It is imported unconditionally because build_agent ALWAYS wraps:
+# see the ResidualAgent block below.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), "t4"))
+from residual import ResidualAgent, load_residual  # noqa: E402
+
 # ---------------------------------------------------------------------------
 # ground truth across the subprocess boundary
 # ---------------------------------------------------------------------------
@@ -129,6 +136,44 @@ def load_weights(agent, sd):
     return agent
 
 
+def residual_path(block=None):
+    """The residual checkpoint for this run, or None.
+
+    $RESIDUAL may contain '{block}', because T-IV pairs residual seed b with
+    evaluation block b: the three blocks are three independent training runs,
+    so the reported spread carries training variance and not just DDPM
+    sampling noise. With no '{block}' the same head is used throughout, and
+    with RESIDUAL unset there is no residual at all.
+    """
+    p = os.environ.get("RESIDUAL", "").strip()
+    if not p:
+        return None
+    if "{block}" in p:
+        if block is None:
+            return None                      # resolved later, per block
+        p = p.format(block=block)
+    if not os.path.exists(p):
+        sys.exit(f"\nRESIDUAL={p} does not exist.\n"
+                 f"Train it first, or unset RESIDUAL to evaluate the base "
+                 f"policy.\n")
+    return p
+
+
+def attach_residual(agent, path, device):
+    """Load `path` into `agent` and say so. Returns the resolved metadata."""
+    head, alpha, act_horizon, meta = load_residual(path, device)
+    if act_horizon != agent.act_horizon:
+        sys.exit(f"\n{os.path.basename(path)} was trained against "
+                 f"act_horizon={act_horizon} but this checkpoint's is "
+                 f"{agent.act_horizon}.\nThe base policy would be re-planned at "
+                 f"a different rate than it was trained and evaluated at.\n")
+    agent.set_residual(head, alpha)
+    print(f"  residual:        {os.path.basename(path)}  alpha={alpha:.4f} "
+          f"({alpha * 100:.1f} mm/step)  res_horizon={head.res_horizon}  "
+          f"mode={meta.get('mode', '?')} seed={meta.get('seed', '?')}")
+    return meta
+
+
 def build_agent(ckpt_path, state_mode, num_envs, device=None, video_dir=None,
                 max_episode_steps=200, expose_poses=True, reward_mode="sparse"):
     """The full checkpoint -> (agent, envs, args, device) path, shared by every
@@ -192,7 +237,20 @@ def build_agent(ckpt_path, state_mode, num_envs, device=None, video_dir=None,
                           video_dir=video_dir, wrappers=wrappers)
 
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    agent = load_weights(T.Agent(envs, args).to(device), sd)
+    base = load_weights(T.Agent(envs, args).to(device), sd)
+
+    # ALWAYS wrapped, even with no residual. CLAUDE.md: "Both arms must go
+    # through that one path, or the before/after compares two code paths as
+    # well as two policies." With head=None ResidualAgent adds no tensor op and
+    # returns the base's own chunk, so the before arm is bit-identical to what
+    # every committed T-II number was measured on.
+    agent = ResidualAgent(base, head=None, act_horizon=args.act_horizon)
+    p = residual_path()
+    if p:
+        attach_residual(agent, p, device)
+    elif os.environ.get("RESIDUAL", "").strip():
+        print(f"  residual:        per-block, from "
+              f"{os.environ['RESIDUAL']}")
     return agent, envs, args, device
 
 
@@ -208,6 +266,24 @@ def to_device(obs, device):
 # ---------------------------------------------------------------------------
 
 
+def sha16(path, n=1 << 20):
+    """Content hash of a file, truncated to 16 hex chars.
+
+    Module level because the per-block residual is hashed by eval_modes.py,
+    after manifest() has already run, and two implementations of "the hash"
+    is exactly how two numbers stop being attributable to the same weights.
+    """
+    import hashlib
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            while (b := f.read(n)):
+                h.update(b)
+        return h.hexdigest()[:16]
+    except Exception:
+        return "unknown"
+
+
 def manifest(**extra):
     """Everything needed to interpret a number six weeks later.
 
@@ -221,21 +297,11 @@ def manifest(**extra):
         except Exception:
             return default
 
-    def sha(path, n=1 << 20):
-        """Content hash of the checkpoint, so a number is attributable to the
-        exact weights that produced it. The path alone is not enough:
-        train_rgbd.py derives its output dir from --exp-name and overwrites
-        checkpoints in place, so the same path can hold different weights on
-        different days. verify.py asserts every pass shares one hash."""
-        import hashlib
-        try:
-            h = hashlib.sha256()
-            with open(path, "rb") as f:
-                while (b := f.read(n)):
-                    h.update(b)
-            return h.hexdigest()[:16]
-        except Exception:
-            return "unknown"
+    # sha16 is module level; see its docstring. The path alone is not enough
+    # to attribute a number, because train_rgbd.py overwrites checkpoints in
+    # place, so the same path can hold different weights on different days.
+    # verify.py asserts every pass shares one hash.
+    sha = sha16
 
     import gymnasium
 
@@ -257,4 +323,9 @@ def manifest(**extra):
     m.update(extra)
     if "ckpt" in m:
         m["ckpt_sha256"] = sha(m["ckpt"])
+    # Same argument as ckpt_sha256: a residual path is not enough to attribute a
+    # number, because training overwrites in place. Only present when a residual
+    # was actually used, so every pre-T-IV manifest is unchanged.
+    if m.get("residual"):
+        m["residual_sha256"] = sha(m["residual"])
     return m

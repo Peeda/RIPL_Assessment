@@ -83,6 +83,7 @@ def main():
 
     for seed in seeds:
         for k in range(attempts):
+            agent.reset_chunk()      # drop any unconsumed base chunk
             obs, info = envs.reset(seed=[seed])
             a0 = np.asarray(info["cubeA_pose"][0], float).reshape(-1)
             b0 = np.asarray(info["cubeB_pose"][0], float).reshape(-1)

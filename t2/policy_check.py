@@ -8,17 +8,28 @@ whether the actions came from the checkpoint. A harness that silently fell back
 to random actions, or loaded an untrained network, would still produce a CSV
 whose initial states cross-check perfectly.
 
-So run the same seeds four ways and compare:
+So run the same seeds several ways and compare:
 
   policy      the checkpoint, as the real passes use it
+  base        with $RESIDUAL set: the SAME object, residual detached
   untrained   identical architecture, freshly initialised weights
   random      uniform samples from the action space
   zero        no action at all
 
 The claim "the rollouts are driven by the trained policy" is exactly the claim
-that arm 1 beats the other three by a wide margin. 'untrained' is the arm that
+that arm 1 beats the controls by a wide margin. 'untrained' is the arm that
 matters most: random and zero only show that *some* network is being consulted,
 while untrained shows it is the LEARNED weights doing the work.
+
+The 'base' arm only appears when $RESIDUAL is set, and it is what T-IV needs.
+Every offline check in this harness is blind to the residual: a run that loaded
+the head and then never applied it produces a CSV whose initial states join
+perfectly against the seed index and whose manifest carries the right
+residual_sha256. Detaching the head from the same ResidualAgent - so the two
+arms differ in one attribute and nothing else - is the only thing that shows
+the residual reached the actuator. It is NOT expected to be a large gap: a
+5 mm/step correction on a 0.73 policy is a few points, so read this arm as
+"different from base at all", not as a success-rate claim.
 
   python t2/policy_check.py $CKPT --episodes 30 --seeds 6000
 """
@@ -32,16 +43,19 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from geometry import wilson  # noqa: E402
 from harness import build_agent, manifest, to_device  # noqa: E402
+from residual import ResidualAgent  # noqa: E402
 
 MAX_EP_STEPS = 200
 
 
-def run(envs, act_fn, seeds, num_envs, device):
+def run(envs, act_fn, seeds, num_envs, device, agents=()):
     """One arm. Returns success_once per episode, in seed order."""
     out = []
     for start in range(0, len(seeds), num_envs):
         batch = seeds[start:start + num_envs]
         bseeds = batch + [batch[-1]] * (num_envs - len(batch))
+        for ag in agents:
+            ag.reset_chunk()
         obs, info = envs.reset(seed=bseeds)
         ever = np.zeros(num_envs, bool)
         steps, done = 0, False
@@ -82,9 +96,11 @@ def main():
     print(f"  seeds       {min(seeds)}..{max(seeds)}  ({a.episodes} episodes per arm)")
     print("")
 
-    # Same architecture, never loaded. type(agent) avoids re-importing the
-    # baseline's module and guarantees it is literally the same class.
-    untrained = type(agent)(envs, args).to(device)
+    # Same architecture, never loaded. type(agent.base) avoids re-importing the
+    # baseline's module and guarantees it is literally the same class. Wrapped
+    # the same way as the policy arm so the two differ in weights alone.
+    untrained = ResidualAgent(type(agent.base)(envs, args).to(device),
+                              head=None, act_horizon=args.act_horizon)
 
     def policy(obs):
         with torch.no_grad():
@@ -101,6 +117,9 @@ def main():
     obs0, _ = envs.reset(seed=seeds[:1] * a.num_envs)
     with torch.no_grad():
         H, A = policy(obs0).shape[1:]
+    # The probe consumed part of a base chunk; drop it or the first arm starts
+    # mid-plan while the others start at a boundary.
+    agent.reset_chunk()
     print(f"  action chunk  {H} steps x {A} dims per policy call")
 
     def random_act(obs):
@@ -111,23 +130,42 @@ def main():
     def zero_act(obs):
         return np.zeros((a.num_envs, H, A), dtype=np.float32)
 
-    arms = [("policy", policy), ("untrained", untrained_act),
-            ("random", random_act), ("zero", zero_act)]
-    res = {}
+    arms = [("policy", policy)]
+    if agent.head is not None:
+        arms.append(("base", policy))     # same fn; the head is detached below
+    arms += [("untrained", untrained_act), ("random", random_act),
+             ("zero", zero_act)]
+    res, head = {}, agent.head
     for name, fn in arms:
+        # 'base' is the identical object with the residual taken off, so the
+        # two arms cannot differ in the env, the seeds, or the code path.
+        agent.head = None if name == "base" else head
         torch.manual_seed(1)
         np.random.seed(1)
         envs.action_space.seed(1)
-        res[name] = run(envs, fn, seeds, a.num_envs, device)
+        res[name] = run(envs, fn, seeds, a.num_envs, device,
+                        agents=(agent, untrained))
         k, n = int(res[name].sum()), len(res[name])
         lo, hi = wilson(k, n)
         print(f"  {name:<10} success_once {k}/{n} = {k/n:.3f}  [{lo:.3f}, {hi:.3f}]",
               flush=True)
     envs.close()
 
+    agent.head = head
     p = res["policy"].mean()
     others = max(res[k].mean() for k in ("untrained", "random", "zero"))
     print("")
+    if "base" in res:
+        d = res["policy"] - res["base"]
+        print(f"  residual effect  policy - base = {d.mean():+.3f}  "
+              f"({int((d != 0).sum())}/{len(d)} episodes changed outcome)")
+        if not (d != 0).any():
+            print(f"  !! the residual changed NOTHING on {len(d)} episodes. "
+                  f"Either alpha is 0, the head\n"
+                  f"     is at its initialisation, or it is not reaching the "
+                  f"action. Check before trusting\n"
+                  f"     any T-IV number from this checkpoint.")
+        print("")
     if p > others + 0.20:
         print(f"  PASS  the policy arm beats every control by "
               f"{p - others:+.3f}. The rollouts are driven by the trained")

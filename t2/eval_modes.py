@@ -46,7 +46,8 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from geometry import (COLUMNS, EVAL_BASE, MODES, cube_features,  # noqa: E402
                       geom_from_row, reserved_hit, wilson)
-from harness import (build_agent, flag, manifest, poses_from_info,  # noqa: E402
+from harness import (attach_residual, build_agent, flag,  # noqa: E402
+                     manifest, poses_from_info, residual_path, sha16,
                      to_device)
 
 MAX_EP_STEPS = int(os.environ.get("MAX_EP_STEPS", 200))
@@ -181,6 +182,12 @@ def run_block(agent, envs, device, tag, block, seeds, index, used, num_envs):
         # than rebuilding the vector env at a smaller width, and drop the
         # padding rows afterwards.
         bseeds = batch + [batch[-1]] * (num_envs - len(batch))
+
+        # Drop any unconsumed base chunk. Only reachable when T-IV runs a
+        # residual with res_horizon < act_horizon AND the previous episode ended
+        # mid-chunk; carrying that plan into a fresh initial state would apply
+        # the last episode's actions to this one's cubes.
+        agent.reset_chunk()
 
         obs, info = envs.reset(seed=bseeds)
         n = len(batch)
@@ -339,6 +346,9 @@ def main():
     # Shared across every mode and block, so disjointness is enforced globally
     # rather than per-pass.
     used = set()
+    # Residual provenance for the block currently loaded. Empty for the base
+    # policy, so every pre-T-IV manifest keeps exactly the keys it had.
+    block_meta = {}
     by_mode, t0 = {}, time.time()
     for tag in a.modes:
         blocks = []
@@ -378,6 +388,18 @@ def main():
                       f"FORCE=1 to re-run.")
                 continue
 
+            # T-IV pairs residual seed b with block b, so the head changes here
+            # while the base, the env and the seed selection do not. build_agent
+            # has already attached a non-templated $RESIDUAL, and this is a
+            # no-op when there is none.
+            rp = residual_path(b)
+            if rp:
+                rm = attach_residual(agent, rp, device)
+                block_meta = dict(
+                    residual=rp, residual_sha256=sha16(rp),
+                    **{f"residual_{k}": rm[k] for k in
+                       ("mode", "seed", "alpha", "res_horizon") if k in rm})
+
             # Policy seed b. Set immediately before the block so each block's
             # DDPM sampling is reproducible from its own seed.
             torch.manual_seed(b)
@@ -390,7 +412,7 @@ def main():
                 w.writeheader()
                 w.writerows(rows)
             with open(prefix + "_manifest.json", "w") as f:
-                json.dump(dict(meta, mode=tag, block=b, policy_seed=b,
+                json.dump(dict(meta, **block_meta, mode=tag, block=b, policy_seed=b,
                                episodes=len(rows),
                                seed_min=min(block_seeds), seed_max=max(block_seeds),
                                wall_seconds=round(time.time() - t0, 1)), f, indent=2)

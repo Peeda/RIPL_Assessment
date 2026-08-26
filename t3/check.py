@@ -326,6 +326,8 @@ def run_arm(arm, agent, envs, device, tag, seeds, num_envs, policy_seed):
     for start in range(0, len(seeds), num_envs):
         batch = seeds[start:start + num_envs]
         bseeds = batch + [batch[-1]] * (num_envs - len(batch))
+        if hasattr(agent, "reset_chunk"):
+            agent.reset_chunk()  # T-IV's ResidualAgent; a no-op with no residual
         obs, info = envs.reset(seed=bseeds)
         n = len(batch)
         a0 = poses_from_info(info, "cubeA_pose", n)

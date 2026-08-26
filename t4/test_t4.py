@@ -264,4 +264,82 @@ ok(e2.shape == (3, emb_dim) and r2.shape == (3, ACT_H * RES_DIM),
    "the training path returns the embedding and the raw residual")
 ok(lp2.shape == (3,) and v2.shape == (3,), "log-prob and value are per-env")
 
+
+# ---------------------------------------------------------------------------
+# 11. the t2/harness.py seam, without a simulator
+#
+# harness.py's only unconditional non-stdlib imports are gymnasium, numpy,
+# torch and residual, and CubePoseInfo just needs `gym.Wrapper` to exist as a
+# base class. Stubbing gymnasium is therefore enough to import the module and
+# exercise the parts T-IV added - which is worth doing off-pod, because an
+# ImportError or a bad $RESIDUAL path otherwise costs a whole pod cycle.
+# ---------------------------------------------------------------------------
+
+import types  # noqa: E402
+
+_gym = types.ModuleType("gymnasium")
+_gym.Wrapper = type("Wrapper", (), {"__init__": lambda self, env: None})
+sys.modules.setdefault("gymnasium", _gym)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), "t2"))
+import harness  # noqa: E402
+
+os.environ.pop("RESIDUAL", None)
+ok(harness.residual_path() is None, "no RESIDUAL -> no residual")
+ok(harness.residual_path(1) is None, "no RESIDUAL -> none per block either")
+
+with tempfile.TemporaryDirectory() as td:
+    paths = {}
+    for b in (1, 2, 3):
+        q = os.path.join(td, f"residual_seed{b}.pt")
+        h = ResidualHead(emb_dim, res_horizon=ACT_H)
+        with torch.no_grad():
+            h.actor_mean[-1].weight.add_(float(b))    # a distinguishable head
+        save_residual(q, h, alpha=0.05, act_horizon=ACT_H, mode="gap", seed=b)
+        paths[b] = q
+
+    os.environ["RESIDUAL"] = paths[2]
+    ok(harness.residual_path() == paths[2], "a plain RESIDUAL resolves eagerly")
+    ok(harness.residual_path(1) == paths[2], "and ignores the block")
+
+    os.environ["RESIDUAL"] = os.path.join(td, "residual_seed{block}.pt")
+    ok(harness.residual_path() is None,
+       "a {block} template does NOT resolve without a block")
+    for b in (1, 2, 3):
+        ok(harness.residual_path(b) == paths[b], f"{{block}} -> block {b}")
+
+    # sha16 is the same function manifest() hashes the checkpoint with, so a
+    # residual number is attributable the same way a base number is
+    ok(len(harness.sha16(paths[1])) == 16, "sha16 returns 16 hex chars")
+    ok(harness.sha16(paths[1]) != harness.sha16(paths[2]),
+       "different heads hash differently")
+    ok(harness.sha16(os.path.join(td, "nope.pt")) == "unknown",
+       "a missing file hashes to 'unknown', it does not raise")
+
+    # attach_residual swaps the head and refuses an act_horizon mismatch
+    ag = ResidualAgent(FakeBase(), head=None, act_horizon=ACT_H)
+    m = harness.attach_residual(ag, paths[3], "cpu")
+    ok(ag.head is not None and m["seed"] == 3, "attach_residual loads the head")
+    e = torch.randn(2, emb_dim)
+    for b in (1, 2, 3):
+        harness.attach_residual(ag, paths[b], "cpu")
+        ok(close(ag.head.act(e), load_residual(paths[b])[0].act(e)),
+           f"block {b} really gets block {b}'s head")
+
+    bad = ResidualAgent(FakeBase(act_horizon=4), head=None, act_horizon=4)
+    try:
+        harness.attach_residual(bad, paths[1], "cpu")
+        ok(False, "an act_horizon mismatch must be refused")
+    except SystemExit:
+        ok(True, "an act_horizon mismatch is refused, not silently accepted")
+
+os.environ.pop("RESIDUAL", None)
+os.environ["RESIDUAL"] = "/nonexistent/residual.pt"
+try:
+    harness.residual_path()
+    ok(False, "a missing RESIDUAL must be refused")
+except SystemExit:
+    ok(True, "a missing RESIDUAL is refused before any rollout runs")
+os.environ.pop("RESIDUAL", None)
+
 print(f"\n{N} assertions passed.")
