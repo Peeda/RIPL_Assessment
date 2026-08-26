@@ -29,7 +29,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from generate import (EXTRA_BODY, MAX_TOKENS, THINKING, TOOL,  # noqa: E402
-                      _degenerate)
+                      TOOL_CHOICE, _degenerate)
 
 # Small, but genuinely needs a moment's arithmetic - a prompt with nothing to
 # think about produces zero thinking tokens for honest reasons and proves

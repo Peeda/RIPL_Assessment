@@ -1250,10 +1250,10 @@ either — only `generate`.
 
 ### The API call
 
-`claude-opus-5`, streamed, structured through a **forced** `tool_choice` on one
-`emit_artifacts` tool with `strict: true`. Forcing is safe here: the restriction
-requiring `thinking: disabled` alongside a forced `tool_choice` is **Amazon
-Bedrock only**, and this is the first-party API. Version-risky parameters go
+`claude-opus-5`, streamed, structured through one `emit_artifacts` tool with
+`strict: true`, `thinking: adaptive`, and **`tool_choice: auto` — not forced.**
+See the subsection below for why; the earlier "forcing is safe, the restriction
+is Bedrock only" claim was measured and is wrong. Version-risky parameters go
 through an editable `EXTRA_BODY` so the same file works against the 1.x SDK on
 the pod and the 0.109.1 nixpkgs ships. `generate.py` refuses to overwrite an
 existing generation — the call is sampled and costs money, so anything clobbered
@@ -1263,18 +1263,36 @@ is gone; `GEN=2` writes a second directory instead.
 of how LLM-written rewards fail, and it is the strongest paragraph available on
 reward hacking. The exception is a *degenerate* one — see below.
 
-### `thinking: adaptive` is mandatory with the forced `tool_choice`
+### A FORCED `tool_choice` ZEROES THE THINKING — on the first-party API too
 
-**This bit us for real, four generations in a row, and it is invisible.** The
-paragraph above says forcing is safe "because the model still thinks first".
-That was asserted and never sent: `EXTRA_BODY` carried `output_config.effort`
-and no `thinking` field at all, so no response contained a single thinking
-block.
+**This bit us for real, six generations in a row, and it is invisible.** The
+`tool_choice` was forced on the strength of a claim that the `thinking:
+disabled` restriction is Amazon Bedrock only. **That claim is wrong.** Measured
+directly, identical two-line arithmetic prompt, `thinking: adaptive` on all four:
 
-`strict: true` constrained-decodes the tool input **in schema order**, and
-`reward_py` is the first key. With no thinking the model is asked for the
-hardest field cold, before it has reasoned about the mechanism. Measured, on
-four paid calls (kept at `~/ripl/t3/badresults*`):
+| request | thinking | out | stop |
+|---|--:|--:|---|
+| no tools at all | **321** | 818 | end_turn |
+| tools, `tool_choice: auto` | **4000** | 4000 | max_tokens |
+| tools, **forced** `tool_choice` | **0** | 149 | tool_use |
+| tools, forced, no `strict` | **0** | 4000 | max_tokens |
+
+Forcing zeroes thinking whether or not `strict` is set. `strict: true` is the
+second half of the bug: a model that has not reasoned, constrained-decoding a
+four-field object **in schema order** with `reward_py` first, emits a minimal
+schema-valid stub — row three is 149 output tokens, the "x" bug reproduced on
+arithmetic.
+
+**So `tool_choice` is `auto`.** The tool description and the system prompt both
+say the tool is the only way to deliver the answer, and `RETRY_NUDGE` covers a
+turn that answers in prose — that retry is now load-bearing, not belt-and-braces.
+Do not "restore" the forcing for determinism; it costs the reasoning.
+
+`t3/request_probe.py --micro` is the four-request instrument that measured this,
+kept because the same class of bug is silent and cost four paid rounds to find.
+
+What the failure looked like before the fix, on four paid calls (kept at
+`~/ripl/t3/badresults*`):
 
 | run | reward_py | sampler_py | rationale | uncertainties | out tok |
 |---|--:|--:|--:|--:|--:|
@@ -1286,10 +1304,16 @@ four paid calls (kept at `~/ripl/t3/badresults*`):
 One in four came out. `stop_reason` was `tool_use` every time and the schema
 validated every time — **nothing in the response says anything is wrong.**
 
-Three consequences, all now in `generate.py`:
+Consequences, all now in `generate.py`:
 
-- **`"thinking": {"type": "adaptive"}` in `EXTRA_BODY`.** Not `budget_tokens`,
-  which Opus 5 rejects outright.
+- **`tool_choice: {"type": "auto"}`.** Not forced, not `"any"` — with one tool
+  defined, `"any"` is forcing.
+- **`"thinking": {"type": "adaptive"}` as a real keyword argument**, not through
+  `EXTRA_BODY` — that hatch is for parameters the SDK does not know, and putting
+  a known one there hid whether it applied. Not `budget_tokens`, which Opus 5
+  rejects outright. `usage.output_tokens_details.thinking_tokens` is printed on
+  every generation and recorded in the manifest, because a suppressed thinking
+  parameter is otherwise invisible.
 - **`MAX_TOKENS` is shared with thinking.** The one good run spent 12,119 tokens
   on the four fields alone, so 32000 left no margin; it is 64000, overridable
   with `T3_MAX_TOKENS`.

@@ -15,11 +15,23 @@ mis-split writes half a reward function to disk and surfaces two stages later as
 a syntax error. A tool call with `strict: true` returns four named fields the
 API itself validates.
 
-tool_choice is FORCED. Safe here: the restriction requiring
-`thinking: {"type": "disabled"}` alongside a forced tool_choice is specific to
-Amazon Bedrock, and this is the first-party API, so the model still thinks
-before it answers. The retry for a turn with no tool_use block is kept anyway,
-and its firing is logged rather than silently smoothed over.
+tool_choice is NOT FORCED, and the comment that used to sit here saying it was
+safe to force was wrong. It claimed the `thinking: disabled` restriction
+alongside a forced tool_choice was Amazon Bedrock only. It is not: measured on
+this API, with an identical two-line prompt and thinking set to adaptive,
+
+    no tools at all              thinking  321   out   818   end_turn
+    tools, tool_choice auto      thinking 4000   out  4000   max_tokens
+    tools, tool_choice FORCED    thinking    0   out   149   tool_use
+    tools, FORCED, no strict     thinking    0   out  4000   max_tokens
+
+Forcing zeroes the thinking. `strict: true` then turns a model that has not
+reasoned into one that emits a minimal schema-valid object - row three is 149
+output tokens, which is this repo's "x" bug reproduced on arithmetic.
+
+So the model chooses to call the tool, having reasoned first, and the retry for
+a turn with no tool_use block is now load-bearing rather than belt-and-braces.
+Its firing is logged rather than silently smoothed over.
 
 STREAMING because two source files plus two rationales is comfortably 8-16k
 output tokens and adaptive thinking on a hard prompt can run for minutes.
@@ -88,6 +100,13 @@ EXTRA_BODY = {
 # NOT know, and putting a known one there buys nothing while hiding whether it
 # applied. `budget_tokens` is not the spelling any more - Opus 5 rejects it.
 THINKING = {"type": "adaptive"}
+
+# `auto`, NOT {"type": "tool", ...} and not "any". Forcing a tool call zeroes the
+# thinking tokens - measured, see the docstring - and "any" is forcing with one
+# tool defined. The tool description and the system prompt both say the tool is
+# the only way to deliver the answer, and RETRY_NUDGE covers a turn that answers
+# in prose anyway.
+TOOL_CHOICE = {"type": "auto"}
 
 TOOL = {
     "name": "emit_artifacts",
@@ -265,7 +284,7 @@ def main():
                 system=system,
                 messages=messages,
                 tools=[TOOL],
-                tool_choice={"type": "tool", "name": TOOL["name"]},
+                tool_choice=TOOL_CHOICE,
                 thinking=THINKING,
                 extra_body=EXTRA_BODY,
             ) as stream:
@@ -346,7 +365,7 @@ def main():
     with open(os.path.join(a.run, "request.json"), "w") as f:
         json.dump(dict(
             model=a.model, max_tokens=MAX_TOKENS, thinking=THINKING,
-            extra_body=EXTRA_BODY, tool=TOOL,
+            tool_choice=TOOL_CHOICE, extra_body=EXTRA_BODY, tool=TOOL,
             # sha256, not hash(): the builtin is PYTHONHASHSEED-salted, so two
             # runs over a byte-identical system prompt recorded two different
             # values. A provenance field that changes when nothing changed is
