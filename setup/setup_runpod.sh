@@ -183,7 +183,17 @@ uv pip install --python "$VENV/bin/python" \
   matplotlib pandas scipy \
   diffusers huggingface_hub \
   tyro "gymnasium==0.29.1" \
+  anthropic \
   ipykernel jupyterlab
+
+# anthropic is for T-III only (t3/generate.py, the one file that imports it).
+# Unpinned on purpose: t3/generate.py routes every version-risky parameter
+# through extra_body and structures its output with tool use rather than the
+# newer structured-output parameter, so it works against both the 1.x SDK pip
+# resolves here and the 0.109.x nixpkgs ships on the laptop.
+#
+# THE PACKAGE IS NOT THE WHOLE SETUP. t3/generate.py also needs a key, and it
+# does not live in env.sh - see the closing instructions at the end of this file.
 
 # The pip package ships no examples/baselines. Clone for the diffusion_policy
 # and ppo baseline code used in T-I and T-IV.
@@ -225,6 +235,11 @@ print(f"  torch       {torch.__version__}  cuda_available={torch.cuda.is_availab
 print(f"  mani_skill  {mani_skill.__version__}")
 print(f"  sapien      {sapien.__version__}")
 print(f"  gymnasium   {gymnasium.__version__}")
+try:
+    import anthropic
+    print(f"  anthropic   {anthropic.__version__}   (T-III's LLM pipeline)")
+except ImportError:
+    print("  anthropic   MISSING - t3/generate.py will not run")
 assert gymnasium.__version__ < "1.0.0", (
     "gymnasium >= 1.0 breaks every physx_cpu eval with KeyError: 'final_info'. "
     "Something re-resolved it upward; reinstall gymnasium==0.29.1.")
@@ -233,7 +248,10 @@ PY
   echo "gpu:    $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
   echo "driver: $(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)"
   echo "vulkan: $(grep -m1 deviceName "$ROOT/vulkaninfo.txt" | xargs)"
-  "$VENV/bin/python" -c "import torch,mani_skill,sapien,gymnasium; print(f'torch: {torch.__version__}'); print(f'mani_skill: {mani_skill.__version__}'); print(f'sapien: {sapien.__version__}'); print(f'gymnasium: {gymnasium.__version__}')"
+  "$VENV/bin/python" -c "import torch,mani_skill,sapien,gymnasium; print(f'torch: {torch.__version__}'); print(f'mani_skill: {mani_skill.__version__}'); print(f'sapien: {sapien.__version__}'); print(f'gymnasium: {gymnasium.__version__}')
+try:
+    import anthropic; print(f'anthropic: {anthropic.__version__}')
+except ImportError: print('anthropic: MISSING')"
 } > "$ROOT/ENVIRONMENT.txt"
 echo "  saved to $ROOT/ENVIRONMENT.txt"
 
@@ -245,4 +263,13 @@ echo ""
 echo "  source $ROOT/env.sh"
 echo "  tmux new -s smoke"
 echo "  bash setup/smoke_test.sh"
+echo ""
+echo "For T-III only, the LLM pipeline also needs an API key. It goes OUTSIDE"
+echo "the repo and outside env.sh - env.sh is rewritten by every run of this"
+echo "script and is echoed into build logs:"
+echo ""
+echo "  printf 'export ANTHROPIC_API_KEY=sk-ant-...\\n' > $ROOT/anthropic.env"
+echo "  chmod 600 $ROOT/anthropic.env"
+echo ""
+echo "t3/run.sh sources that file if present. Nothing in T-I or T-II needs it."
 echo "=============================================================="

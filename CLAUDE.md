@@ -623,6 +623,27 @@ numbers, and what each check proves. This table is only the file map.
 | `test_geometry.py` | The geometry against hand-computed cases. No deps, ~1 s. |
 | `test_verify.py` | Fabricates a valid pass, corrupts it twelve ways, checks `verify.py` catches each. No deps, ~2 s. |
 
+### `t3/` — the LLM pipeline
+
+**Read `t3/README.md` first.** Same shape as `t2/`: a stdlib core that defines
+what "acceptable" means, a sim half that measures, and a gate that decides.
+
+| | |
+|---|---|
+| `spec.py` | The contract, the thresholds, the statistics (`auc`, `se_null_auc`). **Pure stdlib.** Renders the prompt's contract section, drives the checker, and holds every number the gate applies. |
+| `loader.py` | Layer A: the AST walk, and a guarded `exec`. Stdlib. Five consumers. |
+| `assemble.py` | Frames (via the `ffmpeg` binary) and prompt assembly. Stdlib. |
+| `prompts/*.md`, `env_source/` | **The prompts. A deliverable — quote them from here.** |
+| `generate.py` | The one API call. The only file that imports `anthropic`. |
+| `env_t3.py` | `@register_env("StackCube-T3-v1")`. The whole integration surface. |
+| `probes.py` | Layers B and C: shape/purity/no-mutation, and the degenerate-state battery. |
+| `sampler_check.py` | Layer E: the biased distribution. Needs torch, not ManiSkill. |
+| `align.py` | **Layer D, the centrepiece.** 100 real episodes, scored by the generated reward. |
+| `verify.py` | **The gate.** Reads only files. Exits non-zero. |
+| `report.py` | Three figures. |
+| `test_spec.py`, `test_loader.py`, `test_verify.py` | 35 fixtures and 21 corruptions. No deps, ~3 s. |
+| `run.sh` | The one driver. `test | frames | prompt | generate | lint | probes | sampler | smoke | align | calibrate | verify | report | all`. |
+
 **The split at `geometry.py` / `harness.py` is the load-bearing structural
 call**, and it replaces an optional-import dance that did not work. `t2_common.py`
 imported numpy at module scope while claiming its consumers ran "on a laptop with
@@ -768,6 +789,18 @@ is load-bearing and Blackwell cards already have an open ManiSkill issue.
   seed. `t2/backend_check.py` did this and was removed with the rest of the
   discovery-era harness; recover it from git history (`git log --diff-filter=D
   --  t2/backend_check.py`) rather than rewriting it.
+- **`is_grasping` is False in every hand-injected state.** It reads pairwise
+  contact forces from the last physics step (`panda.py:225-253` →
+  `scene.py:821-833`), so a `reset` plus `set_pose` with no stepping has no
+  contacts to read. Any probe that needs a GRASPED state must restore a real
+  rollout's state dict and step the gripper closed, then assert the flag came
+  back. See the T-III section.
+- **A reward function is not a hook in ManiSkill.** There is no
+  `custom_reward` registration; `BaseEnv.get_reward` dispatches on `reward_mode`
+  to `compute_dense_reward`, and the only supported way to supply one is to
+  subclass and `@register_env` a new uid. `register_env` warns-and-skips on a
+  duplicate uid (`registration.py:221-230`), so a *changed* class silently does
+  not take effect in a live process — restart, do not re-import.
 - **`train.py`'s flag names move between ManiSkill releases.** Re-check
   `--help` rather than trusting any doc, including this one.
 - **`--capture-video` defaults to True.** Pass `--no-capture-video` for anything
@@ -857,20 +890,56 @@ is load-bearing and Blackwell cards already have an open ManiSkill issue.
     *other* cube when attributing a mechanism to one of them.
   - The gate holds comfortably: 0.713 is well below 1, and the nominal pass
     yields 344 failures rather than the ~13 that 0.87 would have given.
+- **The confirmation pass has run, and both pre-registered predictions hold.**
+  3 × 100 fresh seeds per mode from `EVAL_BASE`, on a 25,000-seed index;
+  `t2/verify.py` exits 0 on all nine blocks with a max coordinate diff of 0.0
+  against the index. This is the T-II deliverable:
+
+    | mode | per-block | mean | SD | pooled 95% CI | grasp | place | hold\|pl | predicted |
+    |---|---|--:|--:|---|--:|--:|--:|---|
+    | nominal | 0.700 0.760 0.730 | 0.730 | 0.030 | [0.677, 0.777] | 0.973 | 0.860 | 0.849 | 0.713 |
+    | **gap** | 0.490 0.510 0.540 | **0.513** | 0.025 | [0.457, 0.569] | 0.960 | **0.670** | 0.766 | 0.523 [0.379, 0.662] |
+    | **farb** | 0.520 0.640 0.710 | **0.623** | 0.096 | [0.567, 0.676] | **0.997** | 0.823 | 0.757 | 0.561 [0.410, 0.701] |
+
+  Both land inside their pre-registered intervals, and **the mechanism split
+  reproduces**: `gap` loses placement (0.670 against nominal's 0.860) while
+  holding normally; `farb` grasps essentially always (0.997) and places near
+  baseline while `hold|place` drops. Note `farb`'s SD is 0.096 — nearly four
+  times `gap`'s — so its 0.623 is the softer of the two numbers and the report
+  should say so.
+- **The discovery-era files are separate evidence, not superseded.**
+  `nominal.csv` (the 1,200-episode pass) is what `test_geometry.py` uses to
+  prove the two modes are disjoint on the real distribution and what
+  `report.py --discovery` plots; deleting it silently drops 13 assertions to a
+  SKIP. `t1_seed*.csv` is the T-I deliverable and `t1_trainseed*.csv` is the
+  memorisation contrast. Only `region_near*` / `region_far*` are genuinely
+  superseded. All of it is in git, so a deletion is recoverable with
+  `git checkout -- t2/results/...` — but the skip is silent, so check
+  `test_geometry.py` still reports 303 rather than 290.
 - **The harness was rebuilt** (11 files → 10, ~2,900 lines → ~1,500), collapsing
   three shell drivers into `t2/run.sh` and splitting `t2_common.py` into a
   dependency-free `geometry.py` and a sim-only `harness.py`. Two live bugs were
   found and removed in the process: region selection reached into T-I's seed
   block, and the index was too small for `farb` to fill. See the T-II harness
   section.
+- **T-III's pipeline and sampler are implemented and self-tested; no
+  generation has been run yet.** `t3/` mirrors `t2/`'s shape: a stdlib contract
+  (`spec.py`) rendered into the prompt AND enforced by the checker, a five-layer
+  validator, and a gate that exits non-zero. Self-tests pass on the laptop with
+  the bare interpreter: 35 loader fixtures and **21 gate corruptions, each
+  caught for the right reason**. What is *not* done: no mp4 exists in the repo
+  (they are gitignored), so no prompt has been assembled against real frames and
+  no API call has been made. Method in `t3/README.md`.
 - **Next, in order:**
   1. `bash setup/apply_patches.sh` on the pod (after `setup_runpod.sh`, which
      re-clones ManiSkill and wipes the patch).
-  2. `bash t2/run.sh all` — self-tests, index, policy check, the 3 × 100 × 3
-     evaluation, verify, report. Resumable, ~40 min.
-  3. **`verify.py` must exit 0 before any of it is reported.**
-  4. `SEEDS=... bash t2/run.sh videos` — pick seeds from the mode CSVs so each
-     clip illustrates a mode. mp4s are a T-II deliverable.
+  2. `SEEDS=... WANT=fail bash t2/run.sh videos` — pick failing seeds from
+     `mode_gap_seed1.csv` and `mode_farb_seed1.csv`. mp4s are a T-II
+     deliverable AND T-III's only input; nothing in `t3/` runs without one.
+  3. `bash t2/run.sh report` — the T-II figures, now that the eval is done.
+  4. `MODE=gap VIDEO=<clip>.mp4 bash t3/run.sh all`, then the same for `farb`.
+     **`t3/verify.py` must exit 0 before any T-III number is reported or any
+     reward is used for T-IV.**
   5. Pull before stopping the pod: `bash setup/transfer.sh info`. Figures do
      **not** come back by git; the pod never pushes.
 
@@ -1014,6 +1083,200 @@ contaminate each other and neither number means anything.
 
 Say all of this in the report; a threshold fixed in advance is a materially
 stronger claim than one chosen after seeing the scatter.
+
+---
+
+## T-III — the LLM pipeline
+
+**`t3/README.md` is the method walkthrough.** This section holds only what would
+otherwise be re-litigated.
+
+### The pipeline is one API call; the work is the checking
+
+An LLM will always produce a reward function that runs, returns finite numbers,
+and comes with a persuasive rationale. None of that is evidence it would help.
+So the deliverable's substance is a definition of "acceptable" precise enough to
+check mechanically, plus a gate that applies it:
+
+> A useful reward **ranks real episodes by their real outcome, at the stage the
+> failure mode actually breaks at.**
+
+`generate.py` is 250 lines. The checking is five layers and four files. That
+ratio is the finding, not an accident, and it belongs in the report.
+
+### What the model is given — Eureka-style, not a stats dump
+
+Frames from a real T-II failure clip, a hand-written **natural-language**
+description of the mechanism, and the environment's **own source**. T-II's
+numeric table is withheld by default and only appended under `WITH_STATS=1`, so
+that what the model infers about the mechanism comes from the video and the
+prose. Both arms are runnable and which one produced an artifact is in its
+manifest.
+
+Prompts are **files** under `t3/prompts/`, never string literals in Python, so
+tuning one is a `git diff` — which is exactly what the "manual effort to elicit
+desired results" deliverable has to be able to show. `prompts/hacking.md` is the
+knob; everything else is stable.
+
+The contract and API-surface sections are **rendered from `spec.py`**, the same
+module the checker reads. A rule cannot be tightened without the model being
+told, and `test_spec.py` asserts it.
+
+The environment source is a **committed snapshot with a run-time hash gate**
+(`t3/env_source/`). A live read is unreproducible off-pod and invisible to `git
+diff`; a snapshot rots. Re-hashing the installed copy on every assembly buys
+both. Same move as `ckpt_sha256`.
+
+### Two contract decisions that are load-bearing
+
+- **The sampler takes `(b, device)` and never touches `env`.** 4,096 draws are
+  checkable in a second, on a laptop, with torch and `geometry.py` — and the
+  "sampler reaches into the simulator" hack surface is removed by construction
+  rather than by check.
+- **Parameter names are checked exactly and in order.** `compute_reward(env,
+  action, obs, info)` parses, imports, runs, and computes the reward from the
+  wrong tensor. That has to be a load error.
+
+### `T3_SAMPLER=0` is not a convenience
+
+With the biased sampler on, `reset(seed=s)` no longer produces the state
+`t2/results/seeds.csv` records for `s` — by design. Any measurement that must
+reproduce a T-II episode is then over a different population, and
+`t2/verify.py`'s seed-index join would fail on every episode.
+
+```
+T3_SAMPLER=1   T-IV TRAINING only. A biased distribution is the point.
+T3_SAMPLER=0   anything reproducing a T-II episode: layer D, and T-IV's scoring.
+```
+
+`align.py` forces it off, records it in the manifest, and `verify.py` checks it.
+An alignment pass with it accidentally on yields a plausible AUC over the wrong
+population — exactly the silent wrongness this repo is built to refuse.
+
+### The only change T-III makes to `t2/`
+
+`harness.build_agent` gains a `reward_mode="sparse"` keyword
+(`t2/harness.py:132`, used at `:181`). Default unchanged, so every T-II number
+stays on an identical path. T-III passes `"dense"`, and
+`CPUGymWrapper(record_metrics=True)` then sums the generated reward into
+`info["episode"]["return"]` for free — which is how layer D gets cumulative
+reward with no second rollout loop.
+
+### The conditional AUC is NOT the binding stage test — do not "restore" it
+
+The design intent was that a stage-conditional AUC would catch a grasp-farming
+reward. The arithmetic says otherwise. Successful episodes are a **subset** of
+placed ones, so a reward that ranks success at the top wins every conditional
+pair for free. At T-II's measured stage rates for `gap` (96 grasped, 66 placed,
+52 successful of 100) the floor is `52*30 / (66*30) = 0.788`, already above the
+0.70 threshold — **a reward paying nothing for placement would pass it.**
+
+The binding check is `spec.ALIGN_STAGE_GAP_FRAC`: the mean return must rise from
+`grasped, not placed` to `placed, not success` to `success`, with a margin. A
+grasp-farming reward inverts the first step however large its success bonus.
+The conditional AUC is kept and reported because it is a graded number worth
+having; it is not what the gate leans on.
+
+### A grasped probe state cannot be injected
+
+`Panda.is_grasping` reads pairwise **contact forces** from the last physics step
+(`panda.py:225-253` → `scene.py:821-833`). After a reset plus `set_pose` with no
+stepping there are no contacts, so `is_cubeA_grasped` is **False in every
+hand-injected state** — and "cubeA held above cubeB and never released", the
+canonical consequence of a grasp-heavy reward, is precisely a grasped state.
+
+So `P7_held` is restored from a state dict captured during a real rollout
+(`probes.py --make-fixture`, saved to `t3/fixtures/grasp_hover_states.npz`,
+covered by `.gitignore`'s `!*_states.npz`), stepped twice with the gripper
+closing, and the flag is **asserted** to have come back. `verify.py` fails if it
+did not, rather than scoring a mislabelled state.
+
+### Always run the calibration arm
+
+`bash t3/run.sh calibrate` runs the identical battery on
+`t3/fixtures/stock_reward.py`, a transcription of ManiSkill's own 8-stage
+reward. Without it every AUC is uncalibrated. With it, both possible outcomes
+are reportable — "the LLM beat the reward it was shown at the failing stage" is
+a result, and "it did not" is a better one.
+
+### The API key lives outside the repo, and outside `env.sh`
+
+`$RIPL_ROOT/anthropic.env`, chmod 600, holding `export ANTHROPIC_API_KEY=...`.
+`t3/run.sh` sources it if present and prints only the last four characters.
+
+**Not `env.sh`**: `setup_runpod.sh` rewrites that file on every run and echoes
+it into build logs. Not the repo either — `.gitignore` covers `.env`, `*.key`
+and `credentials*`, but the safe thing is for the key never to be inside the
+working tree at all. `setup_runpod.sh` installs the `anthropic` package and
+prints these instructions at the end; the package alone is not the setup.
+
+Nothing in T-I or T-II needs a key, and `t3/run.sh`'s other stages do not
+either — only `generate`.
+
+### The API call
+
+`claude-opus-5`, streamed, structured through a **forced** `tool_choice` on one
+`emit_artifacts` tool with `strict: true`. Forcing is safe here: the restriction
+requiring `thinking: disabled` alongside a forced `tool_choice` is **Amazon
+Bedrock only**, and this is the first-party API. Version-risky parameters go
+through an editable `EXTRA_BODY` so the same file works against the 1.x SDK on
+the pod and the 0.109.1 nixpkgs ships. `generate.py` refuses to overwrite an
+existing generation — the call is sampled and costs money, so anything clobbered
+is gone; `GEN=2` writes a second directory instead.
+
+**A rejected generation is kept.** Which check caught it is the report's account
+of how LLM-written rewards fail, and it is the strongest paragraph available on
+reward hacking.
+
+### Reusing this harness for T-IV — what transfers and what does not
+
+The whole point of fixing the mode seeds is that the *same* evaluation runs
+before and after the residual is trained. Most of `t2/` is policy-agnostic and
+transfers untouched; exactly one piece does not.
+
+**Transfers as-is.** Seed selection, the four per-episode reset assertions,
+`geometry.COLUMNS`, `verify.py` and `report.py` never look at what produced the
+actions. `eval_modes.select_seeds` is deterministic given the index, so the
+same 300 seeds per mode come back and the before/after is a genuine paired
+comparison rather than two draws from the region. The `nominal` arm runs in the
+identical shape, which is where T-IV's "near-zero degradation on the nominal
+distribution" number comes from — it is already being measured, not a separate
+job.
+
+**Does not transfer: `harness.build_agent`.** It constructs a stock diffusion
+policy `T.Agent(envs, args)` and does a strict `load_state_dict`
+(`harness.py:127`), so a residual checkpoint — frozen base plus a PPO-trained
+head — fails on unexpected keys. `inspect_ckpt` rejects it earlier still if the
+top-level layout is not `ema_agent`/`agent`. This is a loud `RuntimeError`, not
+a silently wrong number, but it does mean T-IV must add a seam: a wrapper that
+holds the frozen base agent and applies `a = a_base + clip(Δ, −α, α)` to the
+three translation dims, selected by what the checkpoint actually contains.
+**Both arms must go through that one path**, or the before/after compares two
+code paths as well as two policies.
+
+**Two operational traps when running the after-pass:**
+
+- **Use a different `T2_OUT`.** `eval_modes.py` refuses to overwrite a finished
+  block, on purpose — rollouts are stochastic and anything clobbered is gone.
+  So pointing the residual run at the base pass's directory does not crash: it
+  skips every block and reprints the base numbers. That is the failure mode to
+  watch for. `FORCE=1` is the wrong fix; a second directory is the right one.
+- **Copy `seeds.csv` across rather than rebuilding it.** Selection is
+  deterministic *given the index*, so an index rebuilt at a different
+  `INDEX_SEEDS` selects different seeds and the comparison stops being paired.
+
+```bash
+mkdir -p $RIPL_ROOT/t2_after && cp $RIPL_ROOT/t2/seeds.csv $RIPL_ROOT/t2_after/
+T2_OUT=$RIPL_ROOT/t2_after CKPT=/path/to/residual.pt bash t2/run.sh eval
+```
+
+**Videos are a fresh draw, not a replay.** `record_seeds.py` re-runs the seed
+rather than replaying the logged rollout, and it cannot do otherwise:
+`get_action` draws `torch.randn` over the whole batch, so the noise for env *j*
+depends on batch width — eval runs 10 wide, recording runs 1 wide. Caption
+every clip "an episode from this initial state", never "the episode from the
+table". `--want fail` retries until the outcome matches and logs the hit rate
+to `attempts.csv` so the retrying is visible rather than hidden.
 
 ### A correction to this file
 

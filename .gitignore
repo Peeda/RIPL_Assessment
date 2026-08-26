@@ -55,6 +55,10 @@ videos/
 
 # --- secrets -----------------------------------------------------------------
 # LLM API keys for T-III, wandb key, R2/S3 credentials.
+#
+# The T-III key lives OUTSIDE the repo entirely, at $RIPL_ROOT/anthropic.env
+# (chmod 600), which t3/run.sh sources if present. Not in env.sh: that file is
+# rewritten by every setup_runpod.sh run and echoed into build logs.
 .env
 .env.*
 *.key
@@ -113,6 +117,19 @@ env.sh
 # instead, per CLAUDE.md's rule that nothing large goes into git.
 !*_states.npz
 !*_trace.npz
+
+# --- T-III artifacts ---------------------------------------------------------
+# t3/artifacts/**/ holds the committed evidence for the LLM pipeline: the exact
+# assembled prompt, the frames the model was shown, the raw API response, the
+# generated reward.py and sampler.py, and the validation output. All of it is
+# small, all of it is a deliverable ("document the prompt(s) you used"), and a
+# REJECTED generation is kept too - which check caught it is the report's
+# account of how an LLM-written reward fails. .jpg and .json are tracked by
+# omission; this comment exists so nobody adds a blanket rule that catches them.
+#
+# t3/fixtures/grasp_hover_states.npz is a few kB of simulator state captured
+# from one real rollout, and is covered by the !*_states.npz negation above. It
+# is the only way to build a GRASPED probe state - see t3/README.md.
 
 # mp4s stay ignored (*.mp4 above). Reference them from the report; they are
 # regenerable from a seed with record_seeds.py.
