@@ -1354,11 +1354,50 @@ ceiling. Worse, the measured region has `dist_B` median **0.783** and max
 
 This is the `WITH_STATS=0` arm working as designed and showing its cost. The
 prose says "near the outer edge of what the arm can comfortably reach" and the
-contract names 0.8 m as the IK ceiling, so 0.695–0.775 is a *reasonable*
-inference; it is just not our threshold. `gap`'s prose ("the faces are close")
-pins a quantity the model could compute from the cube size, and it landed at
-0.969. **Keep both — the contrast is the "manual effort to elicit desired
-results" deliverable.** The remedy for `farb` is `WITH_STATS=1`, not a hand edit.
+contract named 0.8 m as the IK ceiling — which was itself wrong, see above — so
+0.695–0.775 is a *reasonable* inference; it is just not our threshold. `gap`'s
+prose ("the faces are close") pins a quantity the model could compute from the
+cube size, and it landed at 0.969.
+
+**The fix was the prompt, not the statistics.** `prompts/calibration.md` plus
+the corrected `REACH_MAX`, regenerated as `gen2`, still withholding T-II's
+numbers:
+
+| | hit rate | gen1 → gen2 |
+|---|--:|---|
+| `gap` | 0.969 → **0.892** | slightly worse |
+| `farb` | 0.142 → **0.996** | **7× better** |
+
+`farb_gen2` derived the distribution itself and wrote the capture fraction into
+its own source (`D_B_MIN = 0.78  # far tail ... (~2.7% of draws)`) — which is
+what the section asked for. **Keep both generations; the pair is the "manual
+effort to elicit desired results" deliverable**, and it is a stronger one than
+`WITH_STATS=1` would have been, because the model was never given the answer.
+
+**Hit rate is not the whole test — match the WITHIN-REGION distribution to the
+eval population**, since that is what T-IV is scored on. Against the 25,000-seed
+index:
+
+| | | p5 | med | p95 |
+|---|---|--:|--:|--:|
+| `gap` `dist_max` | eval | 0.5178 | 0.6394 | 0.7375 |
+| | gen1 | 0.5315 | 0.6269 | 0.7214 |
+| | **gen2** | **0.5117** | **0.6391** | **0.7418** |
+| `farb` `dist_B` | eval | 0.7617 | 0.7787 | 0.8146 |
+| | gen1 | 0.7606 | 0.7671 | 0.7741 |
+| | gen2 | 0.7827 | 0.8068 | 0.8458 |
+
+So `gap_gen2` trades 8 points of hit rate for a near-exact distribution match
+and is the better sampler despite the lower number. `farb_gen2`'s floor of 0.78
+sits above the eval median of 0.7787, so **52.3% of eval seeds are never
+sampled** and 2.7% of draws exceed the env's empirical max of 0.8515. Both
+shifts point the same way — training harder than it is scored — which is the
+safe direction for a residual, but say it in the report rather than claiming
+coverage.
+
+Also: `gap_gen2`'s 48-iteration retry loop is dead code. Its first clamped draw
+is valid by construction, so 0.0000 of rows ever enter the loop and the sampler
+is only ever the clamped-midpoint variant. Harmless, and it still matches eval.
 
 ### The T-III slimming did NOT cause any of this — checked, not assumed
 
