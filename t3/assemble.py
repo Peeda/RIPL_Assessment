@@ -43,6 +43,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -294,6 +295,28 @@ def main():
                  f"   Expected {PROMPTS}/failure_{a.mode}.md - it is written by "
                  f"hand,\n   from the T-II measurement, and it is a deliverable.")
     os.makedirs(a.out, exist_ok=True)
+
+    # record_seeds.py names its clips rgb_seed<N>_<outcome>_sep<M>mm.mp4, so the
+    # seed and the outcome are already in the path. Read them from there when
+    # they were not passed explicitly.
+    #
+    # This is not convenience. prompts/frames.md tells the model "the episode's
+    # outcome was: <outcome>", and asserting `failure` over a clip that actually
+    # succeeded actively misleads it about what it is looking at - a worse
+    # error than saying nothing. Forgetting one env var should not be able to
+    # cause that.
+    if a.video:
+        m = re.search(r"_seed(\d+)_", os.path.basename(a.video))
+        if m and a.seed == "unknown":
+            a.seed = m.group(1)
+            print(f"  seed        {a.seed}  (read from the filename)")
+        m = re.search(r"_seed\d+_(fail|success)_", os.path.basename(a.video))
+        if m:
+            got = "failure" if m.group(1) == "fail" else "success"
+            if got != a.outcome:
+                print(f"  outcome     {got}  (from the filename; "
+                      f"--outcome said '{a.outcome}')")
+                a.outcome = got
 
     existing = sorted(glob.glob(os.path.join(a.out, "frames", "*.jpg")))
     if a.video:
