@@ -1261,7 +1261,48 @@ is gone; `GEN=2` writes a second directory instead.
 
 **A rejected generation is kept.** Which check caught it is the report's account
 of how LLM-written rewards fail, and it is the strongest paragraph available on
-reward hacking.
+reward hacking. The exception is a *degenerate* one — see below.
+
+### `thinking: adaptive` is mandatory with the forced `tool_choice`
+
+**This bit us for real, four generations in a row, and it is invisible.** The
+paragraph above says forcing is safe "because the model still thinks first".
+That was asserted and never sent: `EXTRA_BODY` carried `output_config.effort`
+and no `thinking` field at all, so no response contained a single thinking
+block.
+
+`strict: true` constrained-decodes the tool input **in schema order**, and
+`reward_py` is the first key. With no thinking the model is asked for the
+hardest field cold, before it has reasoned about the mechanism. Measured, on
+four paid calls (kept at `~/ripl/t3/badresults*`):
+
+| run | reward_py | sampler_py | rationale | uncertainties | out tok |
+|---|--:|--:|--:|--:|--:|
+| gap | `'placeholder'` | 4070 | `'placeholder'` | `'placeholder'` | 2164 |
+| farb | 7346 | 6394 | 8270 | 6909 | 12119 |
+| gap (2) | `'x'` | `'x'` | `'x'` | `'x'` | 135 |
+| farb (2) | `'x'` | `'x'` | `'x'` | `'x'` | 154 |
+
+One in four came out. `stop_reason` was `tool_use` every time and the schema
+validated every time — **nothing in the response says anything is wrong.**
+
+Three consequences, all now in `generate.py`:
+
+- **`"thinking": {"type": "adaptive"}` in `EXTRA_BODY`.** Not `budget_tokens`,
+  which Opus 5 rejects outright.
+- **`MAX_TOKENS` is shared with thinking.** The one good run spent 12,119 tokens
+  on the four fields alone, so 32000 left no margin; it is 64000, overridable
+  with `T3_MAX_TOKENS`.
+- **A degenerate generation is not written.** `_degenerate()` refuses a field
+  under a length floor or equal to a stub word, saves `response_failed.json`,
+  and leaves the run directory clean — writing `'x'` to `reward.py` means the
+  next attempt needs `--force` for a call that never really happened. Verified
+  against all four recorded responses: it refuses three and accepts the one.
+
+Also: `request.json` records `system_sha256`, not `hash()`. The builtin is
+`PYTHONHASHSEED`-salted, so two runs over a byte-identical system prompt
+recorded two different values — a provenance field that changes when nothing
+changed is worse than no field.
 
 ### Reusing this harness for T-IV — what transfers and what does not
 

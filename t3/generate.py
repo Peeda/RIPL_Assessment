@@ -28,9 +28,16 @@ NOTHING IS OVERWRITTEN AND NOTHING IS THROWN AWAY. The call is sampled and costs
 money, so anything clobbered is gone; and a generation that fails review is
 evidence too - "the model wrote this and the checker caught it" is the report's
 strongest paragraph on reward hacking.
+
+The one thing NOT kept as a generation is a degenerate one. A reward that
+violates the contract is a finding worth reporting; a reward whose entire text
+is the word "placeholder" is an accident of ours, and writing it leaves the run
+directory needing --force to retry a call that never really happened. It goes to
+response_failed.json instead.
 """
 import argparse
 import base64
+import hashlib
 import json
 import os
 import sys
@@ -42,7 +49,22 @@ from loader import check_static  # noqa: E402
 from spec import REWARD_FILE, SAMPLER_FILE  # noqa: E402
 
 MODEL = os.environ.get("T3_MODEL", "claude-opus-5")
-MAX_TOKENS = 32000
+
+# THIS IS A TOTAL OUTPUT BUDGET AND IT IS SHARED WITH THINKING. The one
+# generation that came out whole before adaptive thinking was turned on already
+# spent 12,119 output tokens on the four fields alone; adaptive thinking on a
+# prompt carrying an environment's source and ten frames is added on top of
+# that, not carved out of it. 32000 left no margin. Raise this before lowering
+# effort - the thinking is what makes the reward worth checking at all.
+MAX_TOKENS = int(os.environ.get("T3_MAX_TOKENS", 64000))
+
+# Below these the field did not survive the generation, whatever the API said.
+# The shortest defensible reward.py is a REWARD_MAX line and a def; anything
+# under a few hundred characters is a stub or a truncation, not brevity.
+MIN_CODE_CHARS = 200
+MIN_PROSE_CHARS = 80
+# Observed verbatim in three of the first four generations' fields.
+STUB_WORDS = frozenset({"x", "placeholder", "todo", "tbd", "n/a", "...", "..."})
 
 # Parameters that not every SDK version knows as a keyword argument. Routed
 # through extra_body so the request body stays minimal and this file works
@@ -50,6 +72,21 @@ MAX_TOKENS = 32000
 # to change effort or thinking display; nothing else needs to move.
 EXTRA_BODY = {
     "output_config": {"effort": "high"},
+    # ADAPTIVE THINKING IS NOT OPTIONAL HERE, and leaving it out is what produced
+    # this repo's first four generations. `strict: true` constrained-decodes the
+    # tool input in schema order, so with no thinking the model is asked for
+    # reward_py - the hardest field - cold, before it has reasoned about the
+    # mechanism at all. Measured: it wrote the literal string "placeholder" into
+    # reward.py, rationale.md and uncertainties.md, produced a real sampler in
+    # the one field it had warmed up by, and one run in four came out whole. No
+    # response carried a thinking block. The forced tool_choice above is only
+    # defensible BECAUSE the model thinks first; that was asserted in the
+    # docstring and never actually sent.
+    #
+    # `budget_tokens` is not the spelling any more - it is rejected outright on
+    # Opus 5. Adaptive lets the model size its own reasoning, which is what a
+    # prompt carrying ten frames and an environment's source needs.
+    "thinking": {"type": "adaptive"},
 }
 
 TOOL = {
@@ -156,6 +193,29 @@ def _text(msg):
     return "\n".join(b.text for b in msg.content if b.type == "text")
 
 
+def _degenerate(args_in):
+    """-> list of complaints about a tool call that came back unusable.
+
+    A forced tool_choice plus `strict: true` guarantees a schema-valid object;
+    it does NOT guarantee the fields contain anything. When the output budget
+    runs out mid-call the decoder closes the JSON with minimal fills, and the
+    result validates perfectly while being worthless. Checking the fields is the
+    only thing that catches that, and not writing them is what keeps the run
+    directory retryable without --force.
+    """
+    bad = []
+    for field, floor in (("reward_py", MIN_CODE_CHARS),
+                         ("sampler_py", MIN_CODE_CHARS),
+                         ("rationale", MIN_PROSE_CHARS),
+                         ("uncertainties", MIN_PROSE_CHARS)):
+        v = (args_in.get(field) or "").strip()
+        why = ("a stub" if v.lower().strip(".") in STUB_WORDS
+               else f"{len(v)} chars" if len(v) < floor else None)
+        if why:
+            bad.append(f"{field}: {why}, {v[:60]!r}")
+    return bad
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", required=True, help="the directory assemble.py wrote")
@@ -214,7 +274,31 @@ def main():
 
         args_in = _tool_input(msg)
         if args_in is not None:
-            break
+            bad = _degenerate(args_in)
+            if not bad:
+                break
+            # The API said yes and the schema validated. The content did not
+            # survive. Do not write it: a run directory holding a one-character
+            # reward.py needs --force to retry, which is the wrong prompt to be
+            # given at the moment the generation failed.
+            with open(os.path.join(a.run, "response_failed.json"), "w") as f:
+                f.write(msg.to_json())
+            print(f"\n!! the tool call came back schema-valid and empty "
+                  f"(stop_reason={msg.stop_reason}, "
+                  f"out {msg.usage.output_tokens}/{MAX_TOKENS}):")
+            for b in bad:
+                print(f"     {b}")
+            if msg.stop_reason == "max_tokens":
+                sys.exit(
+                    f"\n   The output budget ran out mid-tool-call, so "
+                    f"`strict: true` closed the JSON\n   with minimal valid "
+                    f"strings. Nothing was written except response_failed.json,"
+                    f"\n   so this directory is still clean.\n\n"
+                    f"   MAX_TOKENS is shared with thinking. Raise it:\n"
+                    f"     T3_MAX_TOKENS={MAX_TOKENS * 2} bash t3/run.sh generate\n"
+                    f"   or lower the effort in generate.py's EXTRA_BODY if the "
+                    f"model has no room\n   left to raise it into.\n")
+            sys.exit(f"\n   Raw reply saved to {a.run}/response_failed.json\n")
         # Forced tool_choice makes this very unlikely, which is exactly why it
         # is worth recording when it happens rather than retrying invisibly.
         print(f"  !! attempt {attempts}: no tool_use block "
@@ -249,7 +333,12 @@ def main():
     with open(os.path.join(a.run, "request.json"), "w") as f:
         json.dump(dict(
             model=a.model, max_tokens=MAX_TOKENS, extra_body=EXTRA_BODY,
-            tool=TOOL, system_sha=hash(system) & 0xFFFFFFFF,
+            tool=TOOL,
+            # sha256, not hash(): the builtin is PYTHONHASHSEED-salted, so two
+            # runs over a byte-identical system prompt recorded two different
+            # values. A provenance field that changes when nothing changed is
+            # worse than no field.
+            system_sha256=hashlib.sha256(system.encode()).hexdigest()[:16],
             # image bytes elided on purpose: a request.json carrying ten
             # base64 jpegs is 2 MB of noise that no diff can read, and the
             # frames themselves are committed next to it.
