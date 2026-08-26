@@ -549,8 +549,20 @@ nix-shell -p "python3.withPackages(ps: [ps.numpy ps.matplotlib])" \
   --run "python3 t2/report.py t2/results/nominal.csv"
 ```
 
-Measured working: numpy 2.5.1, matplotlib 3.11.1. The first invocation builds
-the environment (~1 min); later ones hit the store and start instantly. Note
+Measured working: numpy 2.5.1, matplotlib 3.11.1, **torch 2.12.0, tyro 1.0.15**.
+The first invocation builds the environment (~1 min); later ones hit the store
+and start instantly.
+
+`torch` in particular means `t4/`'s tests run on the laptop:
+
+```bash
+nix-shell -p "python3.withPackages(ps: [ps.torch ps.numpy ps.tyro])" \
+  --run "python3 t4/test_t4.py && python3 t4/test_train_loop.py"
+```
+
+`test_train_loop.py` stubs gymnasium and ManiSkill and runs `train_ppo.main()`
+end to end against a fake env, which is the only way that file gets exercised
+without a pod. Note
 the package set must be attached to the interpreter — a bare
 `nix shell nixpkgs#python3Packages.numpy` puts the package in the store but
 leaves the `python3` on PATH unable to see it, which fails in a way that looks
