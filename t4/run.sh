@@ -185,10 +185,32 @@ limit_threads() {
   echo "  threads       BLAS/OMP pools capped at 1 per worker"
 }
 
+# The OTHER per-worker resource, and the one that is invisible where you would
+# look for it. Every physx_cpu worker builds its own SAPIEN Vulkan renderer
+# with its own GPU buffers, so VRAM also scales with the PROCESS count:
+#
+#   CUDA error at .../sapien-vulkan-2/src/core/buffer.cpp 251: out of memory
+#
+# torch.cuda.max_memory_allocated() - what train_ppo logs as sys/vram_max_gb -
+# does NOT see any of it; it reports the residual head and the DDPM only. So a
+# run can read 0.1 GB right up until the renderer OOMs. Read the ceiling here
+# instead, and quote nvidia-smi rather than sys/vram_max_gb in the report.
+gpu_note() {
+  command -v nvidia-smi >/dev/null || return 0
+  nvidia-smi --query-gpu=name,memory.total,memory.used,memory.free \
+             --format=csv,noheader | while IFS= read -r line; do
+    echo "  gpu           $line"
+  done
+  echo "  NOTE  each worker builds its own Vulkan renderer, so VRAM scales with"
+  echo "        \$NUM_ENVS. If this OOMs in buffer.cpp, lower the width - watch"
+  echo "        nvidia-smi during a small run to get the per-worker cost."
+}
+
 do_smoke() {
   stage "smoke - three tiny PPO iterations, end to end, at \$SMOKE_ENVS=$SMOKE_ENVS"
   find_ckpt
   limit_threads
+  gpu_note
   rm -rf "$RUNS/smoke"
   # One iteration is one episode per env, so it is $MAX_EP_STEPS env steps per
   # env WHATEVER $RES_HORIZON is. Three of them, so the printed rate is not
@@ -211,6 +233,7 @@ do_smoke() {
 do_train() {
   find_ckpt
   limit_threads
+  gpu_note
   for s in $SEEDS; do
     stage "train - mode '$MODE' residual seed $s"
     if [ -f "$RUNS/$MODE/residual_seed$s.pt" ] && [ "${FORCE:-}" != "1" ]; then
