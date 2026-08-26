@@ -1,8 +1,7 @@
 """A hand-written reward that satisfies the contract and passes every layer.
 
-Not a mistake fixture: this is the positive control. A gate that has only ever
-been shown bad inputs is a gate nobody has checked can pass anything, and
-"t3/verify.py exits non-zero" is a worthless property on its own.
+Not a mistake fixture: this is the positive control. A checker that has only
+ever been shown bad inputs is one nobody has confirmed can accept anything.
 
 It is also the shape a good generation should have, so it doubles as the
 worked example the prompt points at. Structure: the stock 8-stage ladder
