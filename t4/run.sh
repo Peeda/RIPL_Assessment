@@ -162,9 +162,33 @@ do_backend() {
   echo "  failure region moves is the outcome that invalidates T-IV."
 }
 
+# physx_cpu vectorises by SUBPROCESS, and every worker's numpy/torch starts an
+# OpenBLAS and an OpenMP pool sized to nproc. At 64 workers on a 128-core box
+# that is ~8,000 threads, and the container's cgroup pids limit refuses them:
+#
+#   OpenBLAS blas_thread_init: pthread_create failed ... Resource temporarily
+#   unavailable ... RLIMIT_NPROC -1 current, -1 max
+#
+# RLIMIT_NPROC being -1 (unlimited) is the tell that the ceiling is the cgroup,
+# which cannot be raised from inside the container. So cap the pools instead.
+# A worker steps ONE env, so its BLAS has nothing to parallelise and the pool
+# was pure oversubscription - expect the step rate to RISE, not fall.
+#
+# Scoped to training on purpose. The T-II before-pass was measured without
+# these, and BLAS thread count changes reduction order, hence the last bits of
+# a float, hence the DDPM trajectory. Setting them for `eval` would leave the
+# after-pass on a fractionally different numerical path from the committed
+# before-pass it is compared against.
+limit_threads() {
+  export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+         NUMEXPR_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1
+  echo "  threads       BLAS/OMP pools capped at 1 per worker"
+}
+
 do_smoke() {
   stage "smoke - three tiny PPO iterations, end to end, at \$SMOKE_ENVS=$SMOKE_ENVS"
   find_ckpt
+  limit_threads
   rm -rf "$RUNS/smoke"
   # One iteration is one episode per env, so it is $MAX_EP_STEPS env steps per
   # env WHATEVER $RES_HORIZON is. Three of them, so the printed rate is not
@@ -186,6 +210,7 @@ do_smoke() {
 
 do_train() {
   find_ckpt
+  limit_threads
   for s in $SEEDS; do
     stage "train - mode '$MODE' residual seed $s"
     if [ -f "$RUNS/$MODE/residual_seed$s.pt" ] && [ "${FORCE:-}" != "1" ]; then
