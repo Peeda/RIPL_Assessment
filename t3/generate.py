@@ -72,22 +72,22 @@ STUB_WORDS = frozenset({"x", "placeholder", "todo", "tbd", "n/a", "...", "..."})
 # to change effort or thinking display; nothing else needs to move.
 EXTRA_BODY = {
     "output_config": {"effort": "high"},
-    # ADAPTIVE THINKING IS NOT OPTIONAL HERE, and leaving it out is what produced
-    # this repo's first four generations. `strict: true` constrained-decodes the
-    # tool input in schema order, so with no thinking the model is asked for
-    # reward_py - the hardest field - cold, before it has reasoned about the
-    # mechanism at all. Measured: it wrote the literal string "placeholder" into
-    # reward.py, rationale.md and uncertainties.md, produced a real sampler in
-    # the one field it had warmed up by, and one run in four came out whole. No
-    # response carried a thinking block. The forced tool_choice above is only
-    # defensible BECAUSE the model thinks first; that was asserted in the
-    # docstring and never actually sent.
-    #
-    # `budget_tokens` is not the spelling any more - it is rejected outright on
-    # Opus 5. Adaptive lets the model size its own reasoning, which is what a
-    # prompt carrying ten frames and an environment's source needs.
-    "thinking": {"type": "adaptive"},
 }
+
+# ADAPTIVE THINKING IS NOT OPTIONAL HERE, and leaving it out is what produced
+# this repo's first generations. `strict: true` constrained-decodes the tool
+# input in schema order, so with no thinking the model is asked for reward_py -
+# the hardest field - cold, before it has reasoned about the mechanism at all.
+# Measured: the literal string "placeholder" in three fields with one real
+# sampler, then "x" in all four. The forced tool_choice above is only defensible
+# BECAUSE the model thinks first; the docstring asserted that and the request
+# never sent it.
+#
+# PASSED AS A REAL KEYWORD, not through EXTRA_BODY. `thinking` is a first-class
+# parameter the 1.x SDK knows; EXTRA_BODY is the hatch for parameters it does
+# NOT know, and putting a known one there buys nothing while hiding whether it
+# applied. `budget_tokens` is not the spelling any more - Opus 5 rejects it.
+THINKING = {"type": "adaptive"}
 
 TOOL = {
     "name": "emit_artifacts",
@@ -193,6 +193,15 @@ def _text(msg):
     return "\n".join(b.text for b in msg.content if b.type == "text")
 
 
+def _thinking_tokens(msg):
+    d = getattr(msg.usage, "output_tokens_details", None)
+    n = getattr(d, "thinking_tokens", None) if d is not None else None
+    if n is None and isinstance(d, dict):
+        n = d.get("thinking_tokens")
+    return n if n is not None else sum(
+        len(getattr(b, "thinking", "")) for b in msg.content if b.type == "thinking")
+
+
 def _degenerate(args_in):
     """-> list of complaints about a tool call that came back unusable.
 
@@ -257,6 +266,7 @@ def main():
                 messages=messages,
                 tools=[TOOL],
                 tool_choice={"type": "tool", "name": TOOL["name"]},
+                thinking=THINKING,
                 extra_body=EXTRA_BODY,
             ) as stream:
                 msg = stream.get_final_message()
@@ -318,6 +328,9 @@ def main():
           f"(cache write {getattr(u, 'cache_creation_input_tokens', 0)}, "
           f"read {getattr(u, 'cache_read_input_tokens', 0)}) "
           f"/ out {u.output_tokens}   {wall:.0f}s")
+    # A request that silently dropped `thinking` is otherwise invisible, and
+    # that is exactly the failure this file already shipped once.
+    print(f"  thinking    {_thinking_tokens(msg)} tokens")
 
     # --- write everything -------------------------------------------------
     files = {REWARD_FILE: args_in["reward_py"],
@@ -332,8 +345,8 @@ def main():
         f.write(msg.to_json())
     with open(os.path.join(a.run, "request.json"), "w") as f:
         json.dump(dict(
-            model=a.model, max_tokens=MAX_TOKENS, extra_body=EXTRA_BODY,
-            tool=TOOL,
+            model=a.model, max_tokens=MAX_TOKENS, thinking=THINKING,
+            extra_body=EXTRA_BODY, tool=TOOL,
             # sha256, not hash(): the builtin is PYTHONHASHSEED-salted, so two
             # runs over a byte-identical system prompt recorded two different
             # values. A provenance field that changes when nothing changed is
@@ -370,6 +383,7 @@ def main():
                        output_tokens=u.output_tokens,
                        cache_read=getattr(u, "cache_read_input_tokens", 0),
                        cache_write=getattr(u, "cache_creation_input_tokens", 0),
+                       thinking_tokens=_thinking_tokens(msg),
                        loadable=ok,
                        anthropic_version=getattr(anthropic, "__version__", "?")),
                   f, indent=2)

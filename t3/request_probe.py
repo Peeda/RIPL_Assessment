@@ -1,8 +1,13 @@
 #!/usr/bin/env python
 """Why did a generation come back as stubs? Bisect the request, one knob at a time.
 
-    python3 t3/bisect.py --run t3/artifacts/gap            # free: read what we have
-    python3 t3/bisect.py --run t3/artifacts/gap --probe    # paid: try variants
+    python3 t3/request_probe.py --run t3/artifacts/gap          # free
+    python3 t3/request_probe.py --run t3/artifacts/gap --probe  # paid
+
+NOT NAMED bisect.py. Running `python3 t3/<name>.py` puts t3/ first on sys.path,
+so the file shadows any stdlib module of the same name for the whole process -
+and `random` imports `bisect`, so `import anthropic` died three frames into
+`email.utils`. Cost one round trip. Nothing in t3/ may take a stdlib name.
 
 TEMPORARY. Delete once the cause is found and the fix is in generate.py.
 
@@ -21,10 +26,12 @@ import base64
 import json
 import os
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from generate import EXTRA_BODY, MAX_TOKENS, TOOL, _degenerate  # noqa: E402
+from generate import (EXTRA_BODY, MAX_TOKENS, THINKING, TOOL,  # noqa: E402
+                      _degenerate)
 
 FLOOR = 200          # chars of reward_py that count as "the model engaged"
 
@@ -53,12 +60,19 @@ def report(msg, label):
     return not _degenerate(inp)
 
 
-def offline(run):
-    p = os.path.join(run, "response_failed.json")
-    if not os.path.exists(p):
-        p = os.path.join(run, "response.json")
-    if not os.path.exists(p):
+def offline(run, pick=None):
+    """The file matters: a stale response.json from an earlier run reads exactly
+    like a fresh failure. Print the name and the age of what was actually read.
+    """
+    cands = [pick] if pick else ["response_failed.json", "response.json"]
+    found = [(c, os.path.getmtime(os.path.join(run, c)))
+             for c in cands if os.path.exists(os.path.join(run, c))]
+    if not found:
         sys.exit(f"no response.json or response_failed.json in {run}")
+    for c, m in sorted(found, key=lambda t: -t[1]):
+        print(f"  present       {c}  ({time.strftime('%H:%M:%S', time.localtime(m))}, "
+              f"{(time.time()-m)/60:.0f} min ago)")
+    p = os.path.join(run, found[0][0])
     raw = json.load(open(p))
     print(f"\n=== step 0: {os.path.basename(p)} (free) ===")
     kinds = {}
@@ -99,10 +113,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", required=True)
     ap.add_argument("--probe", action="store_true", help="make paid API calls")
+    ap.add_argument("--file", help="read this response file rather than guessing")
     ap.add_argument("--model", default=os.environ.get("T3_MODEL", "claude-opus-5"))
     a = ap.parse_args()
 
-    had_thinking = offline(a.run)
+    had_thinking = offline(a.run, a.file)
     if not a.probe:
         print("\n  --probe to try request variants (each costs ~one generation).")
         return
@@ -132,7 +147,8 @@ def main():
         print(f"\n=== probe {label.strip()} ===")
         kw = dict(model=a.model, max_tokens=MAX_TOKENS, system=system,
                   messages=[{"role": "user", "content": v["content"]}],
-                  tools=v["tools"], tool_choice=v["tool_choice"])
+                  tools=v["tools"], tool_choice=v["tool_choice"],
+                  thinking=THINKING)
         if v["extra_body"]:
             kw["extra_body"] = v["extra_body"]
         try:
