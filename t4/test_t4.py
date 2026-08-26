@@ -342,4 +342,65 @@ except SystemExit:
     ok(True, "a missing RESIDUAL is refused before any rollout runs")
 os.environ.pop("RESIDUAL", None)
 
+
+
+# ---------------------------------------------------------------------------
+# 12. simstate round-trip - the ordering trap the backend check rests on
+#
+# flatten_state_dict walks in SORTED key order for stability across ManiSkill
+# versions; set_state_dict reconstructs by name. If the unflattener ever went
+# back to positional order it would read cubeB's pose out of cubeA's slot and
+# the episode would simply start somewhere else - no error, no crash, a
+# perfectly plausible CSV. So the test builds a dict whose INSERTION order is
+# deliberately the reverse of its sorted order.
+# ---------------------------------------------------------------------------
+
+from simstate import flatten_state_dict, state_dict_from_flat  # noqa: E402
+
+torch.manual_seed(7)
+NROW = 5
+sd = {}
+sd["actors"] = {}
+sd["actors"]["cubeB"] = torch.randn(NROW, 7)      # inserted FIRST, sorts second
+sd["actors"]["cubeA"] = torch.randn(NROW, 7)
+sd["articulations"] = {"panda": torch.randn(NROW, 18)}
+
+# flatten_state_dict is PER ENV: capture_states.py hands it one worker's
+# (1, D) state dict at a time, which is why the width below is 7+7+18 and not
+# five times that.
+def one_env(i):
+    return {"actors": {"cubeB": sd["actors"]["cubeB"][i:i + 1],
+                       "cubeA": sd["actors"]["cubeA"][i:i + 1]},
+            "articulations": {"panda": sd["articulations"]["panda"][i:i + 1]}}
+
+
+names, _ = flatten_state_dict(one_env(0))
+ok(len(names) == 7 + 7 + 18, "every leaf float is named, once per env")
+ok(names[0].startswith("actors/cubeA["),
+   "sorted order puts cubeA first, whatever the insertion order was")
+ok(len(set(names)) == len(names), "names are unique")
+
+# a real round trip: one row per env, built the way capture_states writes it
+rows = []
+for i in range(NROW):
+    nm, v = flatten_state_dict(one_env(i))
+    ok(nm == names, "every env produces the same layout")
+    rows.append(v)
+
+back = state_dict_from_flat(names, rows)
+ok(set(back) == {"actors", "articulations"}, "the groups come back")
+ok(set(back["actors"]) == {"cubeA", "cubeB"}, "the entities come back")
+for grp, ent in (("actors", "cubeA"), ("actors", "cubeB"),
+                 ("articulations", "panda")):
+    ok(close(back[grp][ent], sd[grp][ent], 1e-6),
+       f"{grp}/{ent} round-trips to the RIGHT entity")
+ok(not close(back["actors"]["cubeA"], sd["actors"]["cubeB"], 1e-3),
+   "cubeA did not silently receive cubeB's state")
+
+try:
+    state_dict_from_flat(["bogus[0]"], [[1.0]])
+    ok(False, "a malformed state name must raise")
+except ValueError:
+    ok(True, "a malformed state name raises rather than guessing")
+
 print(f"\n{N} assertions passed.")
