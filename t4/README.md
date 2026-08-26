@@ -300,9 +300,17 @@ often than a choice), and prints the caveat when the single design is detected.
 
 ## 6. Training runs on `physx_cpu`, because the gate said so
 
-The plan was to train on `physx_cuda` and score on `physx_cpu`: the T-II
-evaluation measured ~28 env-steps/s on CPU, so a multi-million-step PPO run
-looked infeasible there. `t4/backend_check.py` was built to license that split.
+The plan was to train on `physx_cuda` and score on `physx_cpu`, because CPU
+looked far too slow to carry a multi-million-step PPO run.
+`t4/backend_check.py` was built to license that split.
+
+*(That "too slow" figure was ~28 env-step/s, and it was wrong — it read
+`wall_seconds` in a block manifest as the time for that block, when it is
+CUMULATIVE across the pass. The T-II evaluation actually ran at **112
+env-step/s** on 10 processes: nine blocks of 100 episodes in 1611.8 s, ~179 s
+each. The gate's verdict does not depend on it — CPU training measures ~138
+env-step/s at 64 processes, still ~40× the width GPU would have given — but the
+number is corrected here so it is not planned on again.)*
 
 **It refused.** Replaying the 300 committed nominal initial states on
 `physx_cuda` with the frozen base:
