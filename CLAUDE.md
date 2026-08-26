@@ -1307,6 +1307,39 @@ neither alone is reliable:
   which attempt each field came from, and every attempt is kept as
   `response_attempt<n>.json`.
 
+**The model may emit MORE THAN ONE `emit_artifacts` call in a single turn**,
+splitting its answer — one call carrying the sampler with `reward_py` set to
+`'unused'`, another carrying the reward. Reading only the first threw away half
+of a 56,032-token generation *and reported the half it kept as a stub*.
+`_tool_inputs` returns every call in the turn and `_merge` folds them together.
+
+**A user turn following an assistant turn that contains `tool_use` must open
+with a `tool_result` for EVERY `tool_use` id**, or the API returns
+`400 ... "tool_use ids were found without tool_result blocks immediately
+after"`. `_followup` builds that. This killed the stub retry the first time it
+ever fired, which is the general lesson: a retry path that has never run is not
+a retry path.
+
+### The T-III slimming did NOT cause any of this — checked, not assumed
+
+Worth recording because the question is natural and the answer is not obvious.
+
+- `9ded615` is the only slim commit that touched `generate.py`, and its only
+  executable changes were the post-generation lint printing and one manifest key
+  (`layer_a_passed` → `loadable`). `TOOL`, `EXTRA_BODY`, `MAX_TOKENS`,
+  `tool_choice` and the `stream()` call are untouched. Verified by stripping
+  docstrings and comments with `ast.unparse` and diffing the result.
+- The forced `tool_choice` — the actual cause — entered with `9fcf4bd`, the
+  original `generate.py`, and was present at the pre-slim commit `0f320df`.
+- `faaec05` did soften four sentences of `contract_markdown()` /
+  `api_surface_markdown()`. But **both** surviving prompts, including
+  `badresults/farb` — the one generation that ever succeeded — contain the
+  *post-slim* render, byte-identical to each other. The success came from the
+  slimmed prompt.
+- `badresults`' old `layer_a_passed` key means only that the pod sat between
+  `faaec05` (new `spec.py`) and `9ded615` (new `generate.py`). It is not
+  evidence of a pre-slim generation, and there is no evidence any exists.
+
 What the failure looked like before the fix, on four paid calls (kept at
 `~/ripl/t3/badresults*`):
 

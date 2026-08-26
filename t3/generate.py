@@ -76,7 +76,8 @@ MAX_TOKENS = int(os.environ.get("T3_MAX_TOKENS", 64000))
 MIN_CODE_CHARS = 200
 MIN_PROSE_CHARS = 80
 # Observed verbatim in three of the first four generations' fields.
-STUB_WORDS = frozenset({"x", "placeholder", "todo", "tbd", "n/a", "...", "..."})
+STUB_WORDS = frozenset({"x", "placeholder", "todo", "tbd", "n/a", "...", "...",
+                        "unused", "none", "see above", "omitted", "unchanged"})
 
 # Parameters that not every SDK version knows as a keyword argument. Routed
 # through extra_body so the request body stays minimal and this file works
@@ -218,11 +219,29 @@ def _content(blocks):
     return out
 
 
-def _tool_input(msg):
-    for blk in msg.content:
-        if blk.type == "tool_use" and blk.name == TOOL["name"]:
-            return blk.input
-    return None
+def _tool_inputs(msg):
+    """EVERY emit_artifacts call in the turn, not just the first.
+
+    The model splits its answer across two calls in one turn - one carrying the
+    sampler with reward_py set to 'unused', one carrying the reward - and
+    reading only the first threw away half of a 56,032-token generation and
+    then reported the half it kept as a stub.
+    """
+    return [b.input for b in msg.content
+            if b.type == "tool_use" and b.name == TOOL["name"]]
+
+
+def _followup(msg, text):
+    """A user turn after an assistant turn containing tool_use MUST open with a
+    tool_result for EVERY tool_use id, or the API 400s with
+    "`tool_use` ids were found without `tool_result` blocks immediately after".
+    That is what killed the retry the first time it ever fired.
+    """
+    blocks = [{"type": "tool_result", "tool_use_id": b.id,
+               "content": "Received."}
+              for b in msg.content if b.type == "tool_use"]
+    blocks.append({"type": "text", "text": text})
+    return blocks
 
 
 def _text(msg):
@@ -347,15 +366,18 @@ def main():
         print(f"  attempt {attempts}   out {u.output_tokens} "
               f"(thinking {_thinking_tokens(msg)})   {time.time()-t0:.0f}s")
 
-        args_in = _tool_input(msg)
-        if args_in is None:
+        inputs = _tool_inputs(msg)
+        if not inputs:
             print(f"  !! no tool_use block (stop_reason={msg.stop_reason}). "
                   f"Nudging.")
             messages += [{"role": "assistant", "content": msg.content},
-                         {"role": "user", "content": RETRY_NUDGE}]
+                         {"role": "user", "content": _followup(msg, RETRY_NUDGE)}]
             continue
-
-        best = _merge(best, args_in, attempts)
+        if len(inputs) > 1:
+            print(f"     {len(inputs)} tool calls in one turn - merging all of them")
+        for inp in inputs:
+            best = _merge(best, inp, attempts)
+        args_in = inputs[0]
         merged = {k: v for k, (v, _) in best.items()}
         bad = _degenerate(merged)
         if not bad:
@@ -367,8 +389,8 @@ def main():
         if attempts == 3:
             break
         messages += [{"role": "assistant", "content": msg.content},
-                     {"role": "user", "content": STUB_NUDGE.format(
-                         fields=", ".join(b.split(":")[0] for b in bad))}]
+                     {"role": "user", "content": _followup(msg, STUB_NUDGE.format(
+                         fields=", ".join(b.split(":")[0] for b in bad)))}]
 
     args_in = {k: v for k, (v, _) in best.items()} if best else args_in
     bad = _degenerate(args_in) if args_in else ["no tool call at all"]
