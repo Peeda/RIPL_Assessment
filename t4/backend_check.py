@@ -59,6 +59,12 @@ from simstate import state_dict_from_flat  # noqa: E402
 
 MAX_EP_STEPS = 200
 
+# The stage decomposition, exactly as t2/eval_modes.py logs it. Success alone
+# says the backends differ; these say WHERE. A grasp rate that holds while place
+# and settle fall is contact physics; a grasp rate that falls too is perception
+# or approach, and those have different fixes.
+STEP_FLAGS = ("is_cubeA_grasped", "is_cubeA_on_cubeB", "is_cubeA_static")
+
 
 def np1(x):
     """Any per-env info value -> a flat numpy array.
@@ -140,6 +146,7 @@ def main():
     print("", flush=True)
 
     gpu = np.zeros(n, dtype=int)
+    stage = {k: np.zeros(n, dtype=int) for k in STEP_FLAGS}
     for start in range(0, n, a.num_envs):
         batch = list(range(start, min(start + a.num_envs, n)))
         # Pad by repeating the last state rather than rebuilding the vec env at
@@ -161,7 +168,8 @@ def main():
                          f"  The state injection did not take, so the two arms "
                          f"would describe different episodes.\n")
 
-        ever = np.zeros(a.num_envs, bool)
+        ever = {k: np.zeros(a.num_envs, bool) for k in STEP_FLAGS}
+        fin = [None] * a.num_envs
         steps, done = 0, False
         while not done and steps < MAX_EP_STEPS:
             with torch.no_grad():
@@ -172,16 +180,31 @@ def main():
             for i in range(chunk.shape[1]):
                 obs, rew, term, trunc, info = envs.step(chunk[:, i])
                 steps += 1
-                if "success" in info:
-                    ever |= np1(info["success"]).astype(bool)
+                for k in STEP_FLAGS:
+                    if k in info:
+                        ever[k] |= np1(info[k]).astype(bool)
                 if bool(np1(trunc).any()) or bool(np1(term).any()):
                     done = True
+                    fin = info.get("final_info", info)
                     break
-        # success_once from our own accumulator, not the wrapper's key, so both
-        # arms use an identically-defined metric across two different wrapper
-        # stacks (CPUGymWrapper vs ManiSkillVectorEnv).
+
+        # success_once comes from record_metrics' own episode dict, NOT from a
+        # local accumulator over the top-level info. ManiSkillVectorEnv
+        # auto-resets at truncation, so at the step that ends the episode the
+        # top-level 'success' is already the NEXT episode's - a local
+        # accumulator therefore misses any success that FIRST occurs at step
+        # 200. That is only ~1 point, but the CPU arm reads
+        # info['episode']['success_once'] (eval_modes.py), and two arms scored
+        # by two definitions is not a paired comparison.
+        epi = fin.get("episode", {}) if isinstance(fin, dict) else {}
+        so = np1(epi["success_once"]).astype(int) if "success_once" in epi else None
         for j, i in enumerate(batch):
-            gpu[i] = int(ever[j])
+            gpu[i] = int(so[j]) if so is not None else 0
+            for k in STEP_FLAGS:
+                stage[k][i] = int(ever[k][j])
+        if so is None:
+            sys.exit("\n!! record_metrics gave no episode['success_once']; the "
+                     "two arms would be scored by different definitions.\n")
         seen = min(start + a.num_envs, n)
         print(f"  {seen:>5}/{n}  gpu success_once so far {gpu[:seen].mean():.3f}",
               flush=True)
@@ -213,6 +236,25 @@ def main():
     print("  1.0 - DDPM sampling is stochastic, so identical states disagree")
     print("  even CPU-vs-CPU. That floor was measured at ~0.74.")
 
+    print("\nSTAGE - success alone says the backends differ; this says WHERE.")
+    print(f"    {'stage':>14}  {'cpu':>6}  {'gpu':>6}  {'diff':>6}")
+    for lab, ck, gk in (("grasped", "ever_grasped", "is_cubeA_grasped"),
+                        ("placed", "ever_placed", "is_cubeA_on_cubeB"),
+                        ("static", "ever_static", "is_cubeA_static"),
+                        ("success_once", "success_once", None)):
+        c = np.array([int(r[ck]) for r in cpu_rows]).mean()
+        g = gpu.mean() if gk is None else stage[gk].mean()
+        print(f"    {lab:>14}  {c:6.3f}  {g:6.3f}  {g - c:+6.3f}")
+    cp = np.array([int(r["ever_placed"]) for r in cpu_rows]).astype(bool)
+    gp = stage["is_cubeA_on_cubeB"].astype(bool)
+    ccpu = np.array([int(r["success_once"]) for r in cpu_rows])
+    if cp.sum() and gp.sum():
+        print(f"    {'success|placed':>14}  {ccpu[cp].mean():6.3f}  "
+              f"{gpu[gp].mean():6.3f}  {gpu[gp].mean() - ccpu[cp].mean():+6.3f}")
+    print("\n  A grasp rate that HOLDS while place/settle fall is contact")
+    print("  physics. A grasp rate that falls too is perception or approach -")
+    print("  the policy is visual, so a rendering difference would show here.")
+
     print("\nCONDITIONAL - the marginal agreeing while the region moves is the")
     print("bad outcome, and only this catches it.")
     for key, edges in (("face_gap", [-1, 0.02, 0.04, 0.07, 0.12, 9]),
@@ -231,12 +273,16 @@ def main():
     os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
     with open(a.out + ".csv", "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["row", "seed", "cpu_success_once", "gpu_success_once"])
+        w.writerow(["row", "seed", "cpu_success_once", "gpu_success_once",
+                    "gpu_ever_grasped", "gpu_ever_placed", "gpu_ever_static"])
         for i, r in enumerate(cpu_rows):
-            w.writerow([i, r.get("seed", ""), cpu[i], gpu[i]])
+            w.writerow([i, r.get("seed", ""), cpu[i], gpu[i],
+                        stage["is_cubeA_grasped"][i], stage["is_cubeA_on_cubeB"][i],
+                        stage["is_cubeA_static"][i]])
     meta.update(cpu_success_once=float(cpu.mean()), gpu_success_once=float(gpu.mean()),
                 agreement=agree, mcnemar_chi2=chi2, mcnemar_p=p,
-                cpu_only=b, gpu_only=c)
+                cpu_only=b, gpu_only=c,
+                **{f"gpu_{k}": float(v.mean()) for k, v in stage.items()})
     with open(a.out + "_manifest.json", "w") as f:
         json.dump(meta, f, indent=2)
     print(f"\nwrote {a.out}.csv and {a.out}_manifest.json")
