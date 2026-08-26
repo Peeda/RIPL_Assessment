@@ -1320,6 +1320,46 @@ after"`. `_followup` builds that. This killed the stub retry the first time it
 ever fired, which is the general lesson: a retry path that has never run is not
 a retry path.
 
+### The sandbox's builtins are part of the contract
+
+`loader.SAFE_BUILTINS` is what generated code runs against, and a name missing
+from it fails at **call** time, after `check_static` has passed. `dict` was
+missing. The `gap` generation ended its sampler with
+`return dict(cubeA_xyz=..., ...)` — idiomatic, and the wording the contract
+itself uses — and died with `NameError` after 46,463 output tokens. The `farb`
+generation used a `{...}` literal, which is a bytecode op needing no builtin,
+and worked. Failing a generation on that distinction is indefensible.
+
+The list now carries every ordinary builtin a numerical function might reach
+for, and excludes only what widens reach: `open`/`eval`/`exec`/`compile`, the
+reflection set (`getattr`/`setattr`/`globals`/`vars`/`dir`), and
+`object`/`type`/`super`. `test_t3.test_sandbox_builtins` calls a generated
+function that uses them all — it needs no torch, so the laptop catches this.
+
+### The two generated samplers, scored offline
+
+Both physically valid on every draw, no fallback rows, spread well above
+`SAMPLER_SD_MIN_XY`. They differ entirely in whether they found the region:
+
+| | hit rate | base | enrichment | verdict |
+|---|--:|--:|--:|---|
+| `gap` | **0.969** | 0.0367 | **26×** | ready |
+| `farb` | **0.142** | 0.0342 | 4.2× | **not ready** |
+
+`farb`'s single failing clause is `dist_B >= 0.76`, and the cause is
+arithmetic rather than statistical: the sampler draws
+`rB ~ U(0.695, 0.775)`, so `P(dist_B >= 0.76) = 0.015/0.080 = 0.1875` is a hard
+ceiling. Worse, the measured region has `dist_B` median **0.783** and max
+**0.820** — the sampler's entire range sits below the region's median.
+
+This is the `WITH_STATS=0` arm working as designed and showing its cost. The
+prose says "near the outer edge of what the arm can comfortably reach" and the
+contract names 0.8 m as the IK ceiling, so 0.695–0.775 is a *reasonable*
+inference; it is just not our threshold. `gap`'s prose ("the faces are close")
+pins a quantity the model could compute from the cube size, and it landed at
+0.969. **Keep both — the contrast is the "manual effort to elicit desired
+results" deliverable.** The remedy for `farb` is `WITH_STATS=1`, not a hand edit.
+
 ### The T-III slimming did NOT cause any of this — checked, not assumed
 
 Worth recording because the question is natural and the answer is not obvious.

@@ -165,9 +165,38 @@ def test_auc():
     check(abs(auc_z(1.0, 50, 50) - 0.5 / s) < 1e-9, "auc_z")
 
 
+# Needs no torch, so it runs on the bare interpreter - which is the point.
+# The sandbox's builtins are only exercised when generated code is CALLED, and
+# the missing `dict` that killed a 46,463-token generation sat behind a
+# check_static that passed. Every name here is one a numerical function might
+# reasonably reach for.
+BUILTINS_PROBE = """
+def sample_cube_poses(b, device):
+    xs = sorted(list(range(b)), reverse=True)
+    out = dict(a=tuple(xs), b=[float(x) for x in xs], c=set(xs))
+    out["agg"] = (sum(xs), min(xs), max(xs), abs(-1), round(1.5),
+                  pow(2, 3), divmod(7, 2), len(xs))
+    out["iter"] = (list(zip(xs, xs)), list(map(int, xs)),
+                   list(filter(bool, xs)), list(enumerate(xs)),
+                   list(reversed(xs)), all(True for _ in xs), any(xs))
+    out["typ"] = (isinstance(b, int), bool(b), str(b), repr(b), int(1.0))
+    out["nxt"] = next(iter(xs))
+    return out
+"""
+
+
+def test_sandbox_builtins():
+    """Generated code must be able to call the ordinary builtins."""
+    ns = load_source(BUILTINS_PROBE, "sampler", "builtins_probe.py")
+    got = ns["sample_cube_poses"](3, "cpu")
+    check(isinstance(got, dict), "dict() works inside generated code")
+    check(got["agg"][0] == 3, "aggregation builtins work", str(got["agg"]))
+    check(got["nxt"] == 2, "iter/next work", str(got["nxt"]))
+
+
 def main():
     for t in (test_fixtures_load, test_errors, test_warnings_still_load,
-              test_auc):
+              test_sandbox_builtins, test_auc):
         t()
     if not HAVE_TORCH:
         print("\n  (no torch here - check_static was tested, the "

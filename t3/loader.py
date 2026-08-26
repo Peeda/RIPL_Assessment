@@ -52,10 +52,36 @@ def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
     return __import__(name, globals, locals, fromlist, level)
 
 
+# EVERY ORDINARY BUILTIN A NUMERICAL FUNCTION MIGHT REACCH FOR. The omission of
+# `dict` cost a 46,463-token generation: the model ended its sampler with
+# `return dict(cubeA_xyz=..., ...)` - which is idiomatic, and which the contract
+# asks for in those words ("-> dict with exactly these four keys") - and it died
+# with NameError at call time, after the static check had passed it. A `{...}`
+# literal is a bytecode op and needs no builtin, so the sibling generation that
+# happened to use one worked. That is an arbitrary distinction to fail a
+# generation on.
+#
+# The rule for this list: include anything whose absence would surprise someone
+# writing plain numerical Python. Exclude only what actually widens the reach -
+# open/eval/exec/compile, the attribute and namespace reflection
+# (getattr/setattr/globals/vars/dir), and object/type/super. Static checks
+# already reject dunder attributes and `class`, so this is the second layer, not
+# the only one.
 SAFE_BUILTINS = {
-    "len": len, "range": range, "min": min, "max": max, "abs": abs,
-    "float": float, "int": int, "bool": bool, "enumerate": enumerate,
-    "zip": zip, "sum": sum, "print": print, "round": round,
+    # constructors and containers
+    "dict": dict, "list": list, "tuple": tuple, "set": set,
+    "frozenset": frozenset, "slice": slice,
+    # numbers and text
+    "float": float, "int": int, "bool": bool, "complex": complex,
+    "str": str, "repr": repr, "format": format, "hash": hash,
+    "abs": abs, "round": round, "pow": pow, "divmod": divmod,
+    # iteration and aggregation
+    "len": len, "range": range, "min": min, "max": max, "sum": sum,
+    "sorted": sorted, "reversed": reversed, "enumerate": enumerate,
+    "zip": zip, "map": map, "filter": filter, "all": all, "any": any,
+    "iter": iter, "next": next,
+    # the rest
+    "isinstance": isinstance, "issubclass": issubclass, "print": print,
     "True": True, "False": False, "None": None,
     "__import__": _guarded_import,
     "__build_class__": None,   # `class` is rejected statically; belt and braces
