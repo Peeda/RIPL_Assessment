@@ -113,7 +113,11 @@ TOOL = {
     "description": (
         "Return the dense reward function and the episode-configuration "
         "sampler, as two complete standalone Python modules, plus your "
-        "reasoning. This is the only way to deliver the answer."),
+        "reasoning. This is the only way to deliver the answer, and it is "
+        "called ONCE - there is no follow-up turn in which to fill a field in. "
+        "Every field must contain its final content. A field whose value is "
+        "'placeholder' or 'x' becomes a file with that as its entire "
+        "contents."),
     "strict": True,
     "input_schema": {
         "type": "object",
@@ -156,6 +160,19 @@ TOOL = {
 RETRY_NUDGE = (
     "You did not call the emit_artifacts tool. Call it now with the four "
     "required fields. Do not answer in prose.")
+
+# The model reasons for 24k tokens, writes one field in full, and puts the
+# literal string "placeholder" in the rest - it is behaving as though a further
+# turn is coming. Nothing in a single API call tells it otherwise, so tell it,
+# and give it the turn it is asking for rather than discarding what it wrote.
+STUB_NUDGE = (
+    "These fields came back as stubs rather than content: {fields}.\n\n"
+    "There is no further turn. This is one API call; whatever you return now is "
+    "written to disk and executed against the simulator. A field containing "
+    "'placeholder' becomes a file containing 'placeholder'.\n\n"
+    "Call emit_artifacts again with EVERY field complete. Fields you already "
+    "wrote in full were kept - repeat them unchanged, or improve them, but do "
+    "not shorten them.")
 
 
 def _client():
@@ -221,6 +238,25 @@ def _thinking_tokens(msg):
         len(getattr(b, "thinking", "")) for b in msg.content if b.type == "thinking")
 
 
+def _merge(best, new, attempt):
+    """Keep the longest non-stub value seen for each field, and where it came from.
+
+    A retry costs a full call, and the attempt that stubbed reward_py still
+    wrote a 5,019-character sampler. Throwing that away to take a second
+    attempt's version wholesale would pay twice for one artifact and could
+    replace a good field with a worse one. The two modules are independent by
+    contract - neither imports the other - so mixing attempts is coherent;
+    the manifest records which attempt each field came from.
+    """
+    for k, v in (new or {}).items():
+        if not isinstance(v, str):
+            continue
+        prev = best.get(k, ("", None))[0]
+        if len(v.strip()) > len(prev.strip()):
+            best[k] = (v, attempt)
+    return best
+
+
 def _degenerate(args_in):
     """-> list of complaints about a tool call that came back unusable.
 
@@ -274,9 +310,10 @@ def main():
 
     messages = [{"role": "user", "content": content}]
     t0 = time.time()
-    msg, args_in, attempts = None, None, 0
+    msg, args_in, attempts, best = None, None, 0, {}
+    usage_total = {"in": 0, "out": 0, "think": 0}
 
-    for attempts in (1, 2):
+    for attempts in (1, 2, 3):
         try:
             with client.messages.stream(
                 model=a.model,
@@ -301,55 +338,59 @@ def main():
                      f"(category: {getattr(det, 'category', '?')}).\n"
                      f"   {getattr(det, 'explanation', '')}\n")
 
-        args_in = _tool_input(msg)
-        if args_in is not None:
-            bad = _degenerate(args_in)
-            if not bad:
-                break
-            # The API said yes and the schema validated. The content did not
-            # survive. Do not write it: a run directory holding a one-character
-            # reward.py needs --force to retry, which is the wrong prompt to be
-            # given at the moment the generation failed.
-            with open(os.path.join(a.run, "response_failed.json"), "w") as f:
-                f.write(msg.to_json())
-            print(f"\n!! the tool call came back schema-valid and empty "
-                  f"(stop_reason={msg.stop_reason}, "
-                  f"out {msg.usage.output_tokens}/{MAX_TOKENS}):")
-            for b in bad:
-                print(f"     {b}")
-            if msg.stop_reason == "max_tokens":
-                sys.exit(
-                    f"\n   The output budget ran out mid-tool-call, so "
-                    f"`strict: true` closed the JSON\n   with minimal valid "
-                    f"strings. Nothing was written except response_failed.json,"
-                    f"\n   so this directory is still clean.\n\n"
-                    f"   MAX_TOKENS is shared with thinking. Raise it:\n"
-                    f"     T3_MAX_TOKENS={MAX_TOKENS * 2} bash t3/run.sh generate\n"
-                    f"   or lower the effort in generate.py's EXTRA_BODY if the "
-                    f"model has no room\n   left to raise it into.\n")
-            sys.exit(f"\n   Raw reply saved to {a.run}/response_failed.json\n")
-        # Forced tool_choice makes this very unlikely, which is exactly why it
-        # is worth recording when it happens rather than retrying invisibly.
-        print(f"  !! attempt {attempts}: no tool_use block "
-              f"(stop_reason={msg.stop_reason}). Nudging.")
-        messages += [{"role": "assistant", "content": msg.content},
-                     {"role": "user", "content": RETRY_NUDGE}]
+        u = msg.usage
+        usage_total["in"] += u.input_tokens
+        usage_total["out"] += u.output_tokens
+        usage_total["think"] += _thinking_tokens(msg)
+        with open(os.path.join(a.run, f"response_attempt{attempts}.json"), "w") as f:
+            f.write(msg.to_json())
+        print(f"  attempt {attempts}   out {u.output_tokens} "
+              f"(thinking {_thinking_tokens(msg)})   {time.time()-t0:.0f}s")
 
-    if args_in is None:
+        args_in = _tool_input(msg)
+        if args_in is None:
+            print(f"  !! no tool_use block (stop_reason={msg.stop_reason}). "
+                  f"Nudging.")
+            messages += [{"role": "assistant", "content": msg.content},
+                         {"role": "user", "content": RETRY_NUDGE}]
+            continue
+
+        best = _merge(best, args_in, attempts)
+        merged = {k: v for k, (v, _) in best.items()}
+        bad = _degenerate(merged)
+        if not bad:
+            args_in = merged
+            break
+
+        for b in bad:
+            print(f"     stub: {b}")
+        if attempts == 3:
+            break
+        messages += [{"role": "assistant", "content": msg.content},
+                     {"role": "user", "content": STUB_NUDGE.format(
+                         fields=", ".join(b.split(":")[0] for b in bad))}]
+
+    args_in = {k: v for k, (v, _) in best.items()} if best else args_in
+    bad = _degenerate(args_in) if args_in else ["no tool call at all"]
+    if bad:
         with open(os.path.join(a.run, "response_failed.json"), "w") as f:
             f.write(msg.to_json())
-        sys.exit(f"\n!! two attempts, no tool call. Raw reply saved to "
-                 f"{a.run}/response_failed.json\n")
+        print(f"\n!! {attempts} attempts, still incomplete:")
+        for b in bad:
+            print(f"     {b}")
+        if msg.stop_reason == "max_tokens":
+            print(f"\n   stop_reason is max_tokens, so raise the budget:\n"
+                  f"     T3_MAX_TOKENS={MAX_TOKENS * 2} bash t3/run.sh generate")
+        sys.exit(f"\n   Every attempt is at {a.run}/response_attempt*.json. "
+                 f"Nothing was\n   written as a generation, so the directory is "
+                 f"still clean.\n")
 
     wall = time.time() - t0
-    u = msg.usage
-    print(f"  usage       in {u.input_tokens} "
-          f"(cache write {getattr(u, 'cache_creation_input_tokens', 0)}, "
-          f"read {getattr(u, 'cache_read_input_tokens', 0)}) "
-          f"/ out {u.output_tokens}   {wall:.0f}s")
-    # A request that silently dropped `thinking` is otherwise invisible, and
-    # that is exactly the failure this file already shipped once.
-    print(f"  thinking    {_thinking_tokens(msg)} tokens")
+    print(f"  usage       in {usage_total['in']} / out {usage_total['out']}"
+          f" (thinking {usage_total['think']}) over {attempts} attempt(s)"
+          f"   {wall:.0f}s")
+    print("  fields      " + ", ".join(
+        f"{k}<-a{n}" for k, (_, n) in sorted(best.items())))
 
     # --- write everything -------------------------------------------------
     files = {REWARD_FILE: args_in["reward_py"],
@@ -398,11 +439,10 @@ def main():
         json.dump(dict(model=a.model, stop_reason=msg.stop_reason,
                        request_id=getattr(msg, "_request_id", None),
                        attempts=attempts, wall_seconds=round(wall, 1),
-                       input_tokens=u.input_tokens,
-                       output_tokens=u.output_tokens,
-                       cache_read=getattr(u, "cache_read_input_tokens", 0),
-                       cache_write=getattr(u, "cache_creation_input_tokens", 0),
-                       thinking_tokens=_thinking_tokens(msg),
+                       input_tokens=usage_total["in"],
+                       output_tokens=usage_total["out"],
+                       thinking_tokens=usage_total["think"],
+                       field_attempt={k: n for k, (_, n) in best.items()},
                        loadable=ok,
                        anthropic_version=getattr(anthropic, "__version__", "?")),
                   f, indent=2)

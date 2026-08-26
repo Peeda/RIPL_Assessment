@@ -1291,6 +1291,22 @@ Do not "restore" the forcing for determinism; it costs the reasoning.
 `t3/request_probe.py --micro` is the four-request instrument that measured this,
 kept because the same class of bug is silent and cost four paid rounds to find.
 
+**With thinking restored the model still stubs, and that is a separate bug.** It
+reasons for ~24,000 tokens, writes one field in full, and puts `'placeholder'`
+in the rest — behaving as though a further turn is coming. Two fixes, because
+neither alone is reliable:
+
+- **The prompt says there is one call.** `prompts/task.md` §"One call" and the
+  tool description both state that a field containing `placeholder` becomes a
+  file containing `placeholder`, and that the reward comes before the sampler.
+- **The retry gives it the turn it asked for.** Up to three attempts, and
+  `_merge` keeps the longest non-stub value per field across all of them — the
+  attempt that stubbed `reward_py` still wrote a 5,019-character sampler, and
+  paying twice for one artifact is avoidable. The two modules are independent by
+  contract, so mixing attempts is coherent; `manifest.field_attempt` records
+  which attempt each field came from, and every attempt is kept as
+  `response_attempt<n>.json`.
+
 What the failure looked like before the fix, on four paid calls (kept at
 `~/ripl/t3/badresults*`):
 

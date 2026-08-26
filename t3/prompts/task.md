@@ -44,6 +44,18 @@ never seen measures a distribution shift rather than a failure mode.
 
 {{CONTRACT}}
 
+## One call
+
+You get **one** tool call. There is no follow-up turn, no review round, and no
+chance to fill anything in later: what you return is written to disk as
+`reward.py` and `sampler.py` and executed against the simulator as-is. A field
+containing the word `placeholder` becomes a file containing the word
+`placeholder`.
+
+So return all four fields complete in the same call, and finish the reward
+before you start the sampler — the reward is the harder of the two and it is
+the one T-IV actually trains against.
+
 ## Also return
 
 - `rationale`: why each term is there, what mechanism from the video and the
