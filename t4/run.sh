@@ -116,6 +116,7 @@ PY
 do_test() {
   stage "test - the offline suite"
   python3 "$HERE/test_t4.py"
+  python3 "$HERE/test_train_loop.py"
   python3 "$ROOT/t2/test_geometry.py" | tail -2
 }
 

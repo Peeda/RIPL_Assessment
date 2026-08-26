@@ -414,7 +414,7 @@ sized index selects different seeds and the comparison stops being paired).
 
 | stage | needs | cost |
 |---|---|---|
-| `test` | torch | ~3 s |
+| `test` | torch, tyro | ~8 s |
 | `capture` | ManiSkill, physx_cpu | ~3 min |
 | `backend` | ManiSkill, physx_cuda | ~15 min |
 | `smoke` | ManiSkill, GPU | ~2 min |
@@ -452,6 +452,16 @@ covered is a mistake.
    is 0.897 for `gap`, so ~10% of training episodes are outside the region the
    residual is scored on. That is left as generated, deliberately.
 
+`train_ppo.py` is the one file that cannot be tested for real off-pod, so
+`test_train_loop.py` stubs gymnasium and ManiSkill, stands in a fake base with
+the same surface `train_rgbd.Agent` presents, and runs `main()` end to end. It
+proves nothing about learning — the fake env has no dynamics — but it proves
+every tensor lines up, GAE and the update run, the alpha ramp reaches the
+bound, the checkpoint round-trips through `t2/harness`'s loader, and the CSV
+carries every column `report.py` reads. Mutation-checked: summing instead of
+averaging the sub-step rewards, counting residual steps instead of env steps,
+and dropping the ramp each fail a named assertion.
+
 Bernoulli SE at n=100 is ~5%, and the three-block SD is the honest error bar.
 **"Near-zero degradation" is a claim that 3 × 100 supports only weakly.** Say
 so in the report, as T-II did.
@@ -472,6 +482,7 @@ so in the report, as T-II did.
 | `verify_t4.py` | **stdlib** | the pairing and residual-provenance checks; exits non-zero |
 | `report.py` | numpy + matplotlib | the two figures, the tables |
 | `test_t4.py` | torch | 193 assertions, no simulator |
+| `test_train_loop.py` | torch + tyro | runs `train_ppo.main()` against a STUBBED ManiSkill |
 | `run.sh` | bash | the one driver |
 
 The same layering as `t2/` and `t3/`: what *defines* the method is testable

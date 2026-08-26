@@ -44,7 +44,7 @@ import random
 import sys
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -131,9 +131,10 @@ class Args:
     log_freq: int = 1
     save_freq: int = 50
 
-    batch_size: int = field(init=False, default=0)
-    minibatch_size: int = field(init=False, default=0)
-    num_iterations: int = field(init=False, default=0)
+    # computed in main(), exactly as upstream ppo.py does it
+    batch_size: int = 0
+    minibatch_size: int = 0
+    num_iterations: int = 0
 
 
 class Logger:
@@ -384,6 +385,7 @@ def main():
         inds = np.arange(args.batch_size)
         clipfracs, t_upd = [], time.time()
         approx_kl = torch.zeros((), device=device)
+        pg = v_loss = ent = torch.zeros((), device=device)
         for _ in range(args.update_epochs):
             np.random.shuffle(inds)
             for s0 in range(0, args.batch_size, args.minibatch_size):
