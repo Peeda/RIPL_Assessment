@@ -457,7 +457,7 @@ COLS = ["run_id", "mode", "block", "policy_seed", "seed",
         "final_cubeA_x", "final_cubeA_y", "final_cubeA_z", "cubeB_displacement"]
 
 
-def _pass(d, modes=("nominal", "gap"), n=10, residual=False, **over):
+def _pass(d, modes=("nominal", "gap"), n=10, residual=None, **over):
     os.makedirs(d, exist_ok=True)
     for mode in modes:
         for b in (1, 2, 3):
@@ -475,10 +475,15 @@ def _pass(d, modes=("nominal", "gap"), n=10, residual=False, **over):
                     w.writerow(row)
             man = dict(ckpt_sha256="b6195b5a7d72c396", mode=mode, block=b,
                        policy_seed=b, episodes=n)
-            if residual:
+            if residual == "paired":
                 man.update(residual=f"/r/residual_seed{b}.pt",
                            residual_sha256=f"aaaaaaaaaaaaaaa{b}",
                            residual_seed=b, residual_mode=mode,
+                           residual_alpha=0.05, residual_res_horizon=8)
+            elif residual == "single":
+                man.update(residual="/r/residual_seed1.pt",
+                           residual_sha256="aaaaaaaaaaaaaaa1",
+                           residual_seed=1, residual_mode=mode,
                            residual_alpha=0.05, residual_res_horizon=8)
             man.update(over.get((mode, b), {}))
             _json.dump(man, open(stem + "_manifest.json", "w"))
@@ -494,8 +499,14 @@ def _run(before, after):
 with tempfile.TemporaryDirectory() as td:
     B, A = os.path.join(td, "before"), os.path.join(td, "after")
     _pass(B)
-    _pass(A, residual=True)
-    ok(_run(B, A) == 0, "a valid before/after pair passes")
+    _pass(A, residual="paired")
+    ok(_run(B, A) == 0, "a PAIRED before/after pair passes")
+
+    S = os.path.join(td, "single")
+    _pass(S, residual="single")
+    ok(_run(B, S) == 0,
+       "a SINGLE-residual pass also passes - it is a legitimate design, and "
+       "the one a CPU training budget buys")
 
     def corrupt(fn, why):
         A2 = os.path.join(td, "c")
@@ -533,12 +544,25 @@ with tempfile.TemporaryDirectory() as td:
         _json.dump(m, open(q, "w"))
     corrupt(mispair, "residual seed 1 evaluated in block 3 is caught")
 
-    def one_run(d):
-        for b in (2, 3):
-            q = os.path.join(d, f"mode_gap_seed{b}_manifest.json")
-            m = _json.load(open(q)); m["residual_sha256"] = "aaaaaaaaaaaaaaa1"
-            _json.dump(m, open(q, "w"))
-    corrupt(one_run, "one residual copied across three blocks is caught")
+    def partial(d):
+        # two distinct residuals across three blocks: neither design
+        q = os.path.join(d, "mode_gap_seed3_manifest.json")
+        m = _json.load(open(q)); m["residual_sha256"] = "aaaaaaaaaaaaaaa1"
+        _json.dump(m, open(q, "w"))
+    corrupt(partial, "two residuals across three blocks is caught as neither "
+                     "design")
+
+    def seed_mismatch(d):
+        # one hash but disagreeing seeds - the manifests contradict the weights
+        A3 = os.path.join(td, "c2")
+        shutil.rmtree(A3, ignore_errors=True)
+        shutil.copytree(S, A3)
+        q = os.path.join(A3, "mode_gap_seed2_manifest.json")
+        m = _json.load(open(q)); m["residual_seed"] = 7
+        _json.dump(m, open(q, "w"))
+        return A3
+    ok(_run(B, seed_mismatch(A)) == 1,
+       "one residual hash with disagreeing residual_seed values is caught")
 
     def nosha(d):
         q = os.path.join(d, "mode_gap_seed1_manifest.json")

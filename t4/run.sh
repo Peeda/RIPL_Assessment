@@ -9,16 +9,20 @@
 #   bash t4/run.sh backend     replay them on physx_cuda. THE GATE - run it
 #                              BEFORE spending GPU hours
 #   bash t4/run.sh smoke       one tiny PPO iteration end to end
-#   bash t4/run.sh train       3 residual seeds for $MODE
+#   bash t4/run.sh train       the residual(s) for $MODE ($SEEDS, default 1)
 #   bash t4/run.sh eval        the paired T-II evaluation, physx_cpu
 #   bash t4/run.sh verify      t2/verify.py on the after pass, then verify_t4.py
 #   bash t4/run.sh report      the figures and the before/after table
 #   bash t4/run.sh all         capture, backend, smoke, train, eval, verify, report
 #
-# TRAINING IS GPU, SCORING IS CPU, and `backend` is what licenses that. A seed
-# does not address an episode on physx_cuda and the assertion that should catch
-# it passes and lies, so the seed-addressed harness cannot be ported - see
-# t4/backend_check.py.
+# TRAINING AND SCORING ARE BOTH physx_cpu. `backend` is what decided that: it
+# measured the frozen base at 0.730 on cpu against 0.557 on cuda over the SAME
+# 300 initial states, with the loss concentrated after placement
+# (success|placed 0.849 -> 0.711) and the grasp rate HOLDING - contact physics,
+# not perception, and not a settable config difference. That gap lands exactly
+# on the stage T-II's `farb` mode is defined by, so a residual trained on GPU
+# would be learning to fix a backend artifact. Run `backend` before trusting
+# any of this on a new pod.
 #
 # Two traps, both from CLAUDE.md, both handled here:
 #   * the after pass writes to its OWN $T2_OUT. eval_modes.py refuses to
@@ -49,12 +53,20 @@ RESULTS=${T4_RESULTS:-$ROOT/t4/results}
 T2_SRC=${T2_SRC:-$ROOT/t2/results}
 AFTER=${T4_AFTER:-$RESULTS/after_$MODE}
 
-SEEDS=${SEEDS:-1 2 3}
+# ONE training seed per mode. backend_check measured a 17-point cpu/gpu gap
+# concentrated after placement, so training is physx_cpu and ~40x slower; the
+# budget bought one residual per mode rather than three. The three evaluation
+# blocks therefore vary only the initial states and the DDPM noise, and the
+# report must say that the SD excludes TRAINING variance.
+SEEDS=${SEEDS:-1}
 ALPHA=${ALPHA:-0.05}
 RES_HORIZON=${RES_HORIZON:-0}
-NUM_ENVS=${NUM_ENVS:-64}
-TOTAL_STEPS=${TOTAL_STEPS:-4000000}
-ALPHA_WARMUP=${ALPHA_WARMUP:-1000000}
+# physx_cpu vectorises by SUBPROCESS, so this is a process count, not a batch
+# width. It buys nothing above the core count.
+NUM_ENVS=${NUM_ENVS:-16}
+TRAIN_BACKEND=${TRAIN_BACKEND:-physx_cpu}
+TOTAL_STEPS=${TOTAL_STEPS:-1000000}
+ALPHA_WARMUP=${ALPHA_WARMUP:-250000}
 TRACK=${TRACK:-}
 export STATE_FLAG=${STATE_FLAG:-}
 
@@ -165,6 +177,7 @@ do_train() {
     fi
     python "$HERE/train_ppo.py" --mode "$MODE" --seed "$s" --ckpt "$CKPT" \
       --out "$RUNS/$MODE" --num-envs "$NUM_ENVS" \
+      --sim-backend "$TRAIN_BACKEND" \
       --total-timesteps "$TOTAL_STEPS" --alpha "$ALPHA" \
       --alpha-warmup "$ALPHA_WARMUP" --res-horizon "$RES_HORIZON" ${TRACK:+--track}
   done
@@ -181,10 +194,22 @@ do_eval() {
     [ -f "$RUNS/$MODE/residual_seed$s.pt" ] || {
       echo "!! $RUNS/$MODE/residual_seed$s.pt is missing; train first." >&2; exit 1; }
   done
+  # With ONE training seed the same head runs every block; with three, seed b
+  # is paired to block b so the spread carries training variance too. Chosen
+  # from $SEEDS rather than hardcoded, because getting it wrong silently
+  # evaluates the wrong head.
+  local nseeds
+  nseeds=$(echo $SEEDS | wc -w)
+  if [ "$nseeds" -eq 1 ]; then
+    RES_PATTERN="$RUNS/$MODE/residual_seed$SEEDS.pt"
+  else
+    RES_PATTERN="$RUNS/$MODE/residual_seed{block}.pt"
+  fi
+  echo "  residual      $RES_PATTERN"
   # A SEPARATE T2_OUT. Pointing this at t2/results would skip every finished
   # block and reprint the base numbers - silently.
   T2_OUT="$AFTER" \
-  RESIDUAL="$RUNS/$MODE/residual_seed{block}.pt" \
+  RESIDUAL="$RES_PATTERN" \
   BACKEND=physx_cpu \
     python "$ROOT/t2/eval_modes.py" "$CKPT" $STATE_FLAG \
       --modes ${MODES:-nominal gap farb} --index "$AFTER/seeds.csv" \

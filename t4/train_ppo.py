@@ -61,7 +61,8 @@ from residual import (ACT_DIM, RES_DIM, ResidualAgent, ResidualHead,  # noqa: E4
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "t2"))
-from harness import inspect_ckpt, load_weights, manifest, sha16  # noqa: E402
+from harness import (inspect_ckpt, load_weights, manifest,  # noqa: E402
+                     sha16, to_device)
 
 
 @dataclass
@@ -86,14 +87,21 @@ class Args:
     env_id: str = "StackCube-T4-v1"
     control_mode: str = "pd_ee_delta_pos"
     obs_mode: str = "rgb"
-    sim_backend: str = "physx_cuda"
+    sim_backend: str = "physx_cpu"
+    """physx_cpu, and NOT a default chosen for convenience - t4/backend_check.py
+    measured the frozen base at 0.730 on cpu against 0.557 on cuda over the SAME
+    300 initial states, with the loss concentrated after placement
+    (success|placed 0.849 -> 0.711). See make_envs.py."""
     max_episode_steps: int = 200
-    num_envs: int = 64
+    num_envs: int = 16
+    """On physx_cpu this is a PROCESS count, not a batch width - physx_cpu
+    raises RuntimeError for num_envs > 1 and vectorises by subprocess. It buys
+    nothing above the core count."""
 
     # -- the residual -------------------------------------------------------
     alpha: float = 0.05
     """PD's res_scale. pd_ee_delta_pos maps +-1 to +-0.1 m, so 0.05 = 5 mm/step."""
-    alpha_warmup: int = 1_000_000
+    alpha_warmup: int = 250_000
     """H, in ENV steps. PD's progressive exploration schedule, ramping the bound
     instead of the mixing probability - see alpha_at() in residual.py."""
     res_horizon: int = 0
@@ -104,7 +112,7 @@ class Args:
     log_std_init: float = -1.0
 
     # -- PPO ----------------------------------------------------------------
-    total_timesteps: int = 4_000_000
+    total_timesteps: int = 1_000_000
     """in ENV steps, so it is comparable to the sim cost and to PD's numbers."""
     learning_rate: float = 3e-4
     anneal_lr: bool = True
@@ -166,10 +174,51 @@ class Logger:
             w.writerows(self.rows)
 
 
-def index_obs(obs, mask):
-    if isinstance(obs, dict):
-        return {k: index_obs(v, mask) for k, v in obs.items()}
-    return obs[mask]
+def as_t(x, device):
+    """A step return -> tensor on `device`, from either vector env.
+
+    ManiSkillVectorEnv hands back torch on the sim device; gym's
+    AsyncVectorEnv hands back numpy from the worker pipes.
+    """
+    if isinstance(x, torch.Tensor):
+        return x.to(device)
+    return torch.as_tensor(np.asarray(x)).to(device)
+
+
+def episode_end(infos, device):
+    """Normalise the two backends' episode-boundary conventions.
+
+    -> (mask, {metric: (k,) tensor}, final_obs dict) or (None, {}, None).
+
+    ManiSkillVectorEnv gives ONE dict for the whole batch, with
+    infos['final_info']['episode'][k] a (N,) tensor and 'final_observation' a
+    batched dict. gym.vector.AsyncVectorEnv gives an OBJECT ARRAY of per-env
+    dicts, already unbatched by CPUGymWrapper, with None where the env did not
+    finish. Reading one shape as the other does not raise - it silently
+    averages the wrong thing - which is why this is one function and not two
+    branches at the call site.
+    """
+    if "final_info" not in infos:
+        return None, {}, None
+    fi, m = infos["final_info"], infos["_final_info"]
+
+    if isinstance(fi, dict):                          # ManiSkillVectorEnv
+        mask = as_t(m, device).bool()
+        ep = {k: as_t(v, device)[mask].float() for k, v in fi["episode"].items()}
+        fo = {k: as_t(v, device)[mask] for k, v in infos["final_observation"].items()}
+        return mask, ep, fo
+
+    m = np.asarray(m, dtype=bool)                     # AsyncVectorEnv
+    idx = np.flatnonzero(m)
+    if idx.size == 0:
+        return None, {}, None
+    ep = {k: torch.tensor([float(np.asarray(fi[i]["episode"][k]).reshape(-1)[0])
+                           for i in idx], device=device)
+          for k in fi[idx[0]].get("episode", {})}
+    fos = [infos["final_observation"][i] for i in idx]
+    fo = {k: torch.as_tensor(np.stack([np.asarray(o[k]) for o in fos])).to(device)
+          for k in fos[0]}
+    return torch.as_tensor(m, device=device), ep, fo
 
 
 def main():
@@ -193,6 +242,7 @@ def main():
               "   That is not what T-IV asks for; unset it unless you meant it.")
 
     # ---------------------------------------------------------------- envs
+    on_cpu = args.sim_backend == "physx_cpu"
     envs = make_train_envs(args.env_id, args.num_envs,
                            max_episode_steps=args.max_episode_steps,
                            control_mode=args.control_mode, obs_mode=args.obs_mode,
@@ -244,7 +294,7 @@ def main():
 
     agent = ResidualAgent(base, head=None, act_horizon=act_horizon)
     obs, _ = envs.reset(seed=args.seed)
-    emb_dim = agent.emb_dim(obs)
+    emb_dim = agent.emb_dim(to_device(obs, device))
     head = ResidualHead(emb_dim, res_horizon=res_horizon, hidden=args.hidden,
                         log_std_init=args.log_std_init).to(device)
     agent.set_residual(head, args.alpha)
@@ -318,8 +368,9 @@ def main():
         dnorm = []
 
         for step in range(S):
+            obs_t = to_device(obs, device)
             with torch.no_grad():
-                b_emb_t = agent.embed(obs)
+                b_emb_t = agent.embed(obs_t)
             b_emb[step] = b_emb_t
             b_done[step] = next_done
             with torch.no_grad():
@@ -327,41 +378,47 @@ def main():
             b_act[step], b_logp[step], b_val[step] = raw, logp, val.flatten()
 
             with torch.no_grad():
-                chunk = agent.base_chunk(obs)
+                chunk = agent.base_chunk(obs_t)
                 exe = apply_delta(chunk, raw, alpha)
             dnorm.append(float((exe[..., :RES_DIM] - chunk[..., :RES_DIM])
                                .norm(dim=-1).mean()) * 100.0)   # mm
 
             # ---- execute the chunk -------------------------------------
             rsum, n_sub, done_mid = 0.0, 0, False
+            done_t = torch.zeros(E, device=device, dtype=torch.bool)
             for i in range(exe.shape[1]):
-                obs, rew, term, trunc, infos = envs.step(exe[:, i])
-                rsum = rsum + rew.view(-1)
+                act = exe[:, i]
+                if on_cpu:
+                    act = act.detach().cpu().numpy()
+                obs, rew, term, trunc, infos = envs.step(act)
+                rsum = rsum + as_t(rew, device).view(-1).float()
                 n_sub += 1
                 global_step += E
-                if bool(torch.logical_or(term, trunc).any()):
+                done_t = (as_t(term, device).bool()
+                          | as_t(trunc, device).bool()).view(-1)
+                if bool(done_t.any()):
                     done_mid = True
                     break
             b_rew[step] = rsum / n_sub          # mean over the steps EXECUTED
-            next_done = torch.logical_or(term, trunc).to(torch.float32)
+            next_done = done_t.to(torch.float32)
 
             if done_mid:
                 # The env auto-reset under us, so any unconsumed base plan
                 # belongs to the finished episode.
                 agent.reset_chunk()
-            if "final_info" in infos:
-                m = infos["_final_info"]
-                for k, v in infos["final_info"]["episode"].items():
-                    ep[k].append(v[m].float().mean().item())
+            mask, ep_metrics, fo = episode_end(infos, device)
+            if mask is not None:
+                for k, v in ep_metrics.items():
+                    ep[k].append(float(v.mean()))
                 with torch.no_grad():
-                    fo = index_obs(infos["final_observation"], m)
-                    final_values[step, torch.arange(E, device=device)[m]] = \
-                        head.get_value(agent.embed(fo)).view(-1)
+                    final_values[step, torch.arange(E, device=device)[mask]] = \
+                        head.get_value(agent.embed(to_device(fo, device))).view(-1)
         t_roll = time.time() - t_roll
 
         # ---- GAE (upstream's, verbatim in structure) --------------------
         with torch.no_grad():
-            next_value = head.get_value(agent.embed(obs)).reshape(1, -1)  # noqa: E501
+            next_value = head.get_value(
+                agent.embed(to_device(obs, device))).reshape(1, -1)
             adv = torch.zeros_like(b_rew)
             lastgaelam = 0
             for t in reversed(range(S)):

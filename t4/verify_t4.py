@@ -116,32 +116,56 @@ def main():
     if seen and not FAIL:
         print(f"   ok - {len(seen)} blocks carry a residual")
 
-    print("\n4. residual seed b is evaluated in block b")
-    for key, m in sorted(seen.items()):
-        mode, block = key
-        rs = m.get("residual_seed")
-        if rs is None:
-            bad(f"{key}: the manifest records no residual_seed, so the pairing "
-                f"cannot be checked")
-        elif int(rs) != block:
-            bad(f"{key}: block {block} ran residual seed {rs}. Pairing seed b "
-                f"with block b is what makes the spread include TRAINING "
-                f"variance; running one seed everywhere measures DDPM noise.")
-    if seen and not any("residual seed" in f or "residual_seed" in f for f in FAIL):
-        print("   ok")
-
-    print("\n5. the three blocks ran three different residuals")
+    print("\n4/5. which design was run, and is it coherent")
+    # Two legitimate designs, and they must not be silently mixed:
+    #
+    #   PAIRED   one residual per block, seed b in block b. The three block
+    #            rates are then independent replicates of the whole pipeline
+    #            and their SD carries TRAINING variance.
+    #   SINGLE   one residual across all three blocks. The blocks then vary
+    #            only the initial states and the DDPM noise, so the SD does
+    #            NOT carry training variance and the report must say so.
+    #
+    # Anything in between - two distinct residuals across three blocks - is
+    # neither, and is far more likely to be a mis-set $RESIDUAL than a choice.
     by_mode = {}
     for (mode, block), m in seen.items():
-        by_mode.setdefault(mode, {})[block] = m.get("residual_sha256")
+        by_mode.setdefault(mode, {})[block] = (m.get("residual_sha256"),
+                                               m.get("residual_seed"))
+    designs = {}
     for mode, d in sorted(by_mode.items()):
-        if len(set(d.values())) != len(d):
-            bad(f"mode '{mode}': {len(set(d.values()))} distinct residuals "
-                f"across {len(d)} blocks. One checkpoint copied three times is "
-                f"one training run, and the spread would not carry training "
-                f"variance.")
+        shas = {v[0] for v in d.values()}
+        n = len(d)
+        if len(shas) == n:
+            designs[mode] = "paired"
+            for block, (_, rs) in sorted(d.items()):
+                if rs is None:
+                    bad(f"({mode}, {block}): no residual_seed, so the pairing "
+                        f"cannot be checked")
+                elif int(rs) != block:
+                    bad(f"({mode}, {block}): block {block} ran residual seed "
+                        f"{rs}. Pairing seed b with block b is the whole point "
+                        f"of the paired design.")
+            print(f"   ok - '{mode}': PAIRED, {n} residuals over {n} blocks")
+        elif len(shas) == 1:
+            designs[mode] = "single"
+            seeds = {v[1] for v in d.values()}
+            if len(seeds) != 1:
+                bad(f"mode '{mode}': one residual hash but {len(seeds)} "
+                    f"residual_seed values - the manifests disagree with the "
+                    f"weights.")
+            print(f"   ok - '{mode}': SINGLE residual (seed {seeds.pop()}) "
+                  f"over {n} blocks")
         else:
-            print(f"   ok - '{mode}': {len(d)} distinct residuals")
+            bad(f"mode '{mode}': {len(shas)} distinct residuals across {n} "
+                f"blocks - neither the paired design (one per block) nor the "
+                f"single-residual design. That is almost certainly a mis-set "
+                f"$RESIDUAL rather than a choice.")
+    if any(v == "single" for v in designs.values()):
+        print("\n   NOTE: a SINGLE residual was evaluated across all three "
+              "blocks, so the\n   block-to-block SD reported below reflects "
+              "initial states and DDPM\n   sampling only. TRAINING variance is "
+              "NOT in it. Say so in the report.")
 
     # -- the table ---------------------------------------------------------
     print("\n" + "=" * 78)

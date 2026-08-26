@@ -1022,9 +1022,10 @@ is load-bearing and Blackwell cards already have an open ManiSkill issue.
   stdlib `verify_t4.py`. 193 assertions pass on the laptop
   (`nix-shell -p "python3.withPackages(ps: [ps.torch ps.numpy])"`), and
   `t2/verify.py` still exits 0 on `t2/results` with `test_geometry.py` still at
-  303 — the seam did not disturb the committed T-II evidence. What is NOT done:
-  no backend check has run, no PPO has run, no residual exists. Method in
-  `t4/README.md`.
+  303 — the seam did not disturb the committed T-II evidence. **The backend gate
+  has run and REFUSED physx_cuda**, so training moved to physx_cpu and the
+  budget shrank to one residual per mode; see the T-IV section. What is NOT
+  done: no PPO has run, no residual exists. Method in `t4/README.md`.
 - **Next, in order:**
   1. `bash setup/apply_patches.sh` on the pod (after `setup_runpod.sh`, which
      re-clones ManiSkill and wipes the patch).
@@ -1032,10 +1033,12 @@ is load-bearing and Blackwell cards already have an open ManiSkill issue.
      `mode_gap_seed1.csv` and `mode_farb_seed1.csv`. mp4s are a T-II
      deliverable AND T-III's only input.
   3. `bash t2/run.sh report` — the T-II figures, now that the eval is done.
-  4. `bash t4/run.sh backend` — **the gate.** Licenses training on GPU while
-     scoring on CPU. Run it BEFORE spending GPU hours.
+  4. `bash t4/run.sh backend` — **the gate. It has run, and it REFUSED
+     physx_cuda** (see the T-IV section). Re-run it on any new pod.
   5. `MODE=gap bash t4/run.sh smoke`, then `train`, `eval`, `verify`. Then the
-     same for `farb`. Then `bash t4/run.sh report`.
+     same for `farb`. Then `bash t4/run.sh report`. Training is physx_cpu, so
+     `--num-envs` is a PROCESS count — measure `env-step/s` from `smoke` before
+     sizing `TOTAL_STEPS`.
   6. If the nominal arm degrades by more than ~3 points, rerun that mode at
      `T4_NOMINAL_FRAC=0.5` and report both as the mixing ablation.
   7. Pull before stopping the pod: `bash setup/transfer.sh info`. Figures do
@@ -1670,14 +1673,48 @@ accumulates; the binding limit is the IK saturating, which is why
 against `charts/alpha_mm` so saturation is visible rather than inferred. Tune α
 on TRAINING success, never on the eval set.
 
-### Train on GPU, score on CPU, and run `backend_check.py` first
+### MEASURED: physx_cuda does not reproduce physx_cpu for this policy
 
-physx_cpu measured ~28 env-steps/s, so 4M steps is ~40 h per residual. But a
-seed does not address an episode on physx_cuda and the assert that should catch
-that passes and lies. `t4/backend_check.py` (recovered from `c1c010b^`)
-sidesteps seeds entirely: `capture_states.py` reads the exact CPU initial
-states of the 300 committed nominal episodes, and the check replays them on GPU
-through `reset_to_env_states`.
+The plan was train-on-GPU / score-on-CPU. **`t4/backend_check.py` refused it**,
+and the numbers are a report paragraph. 300 committed nominal initial states,
+injected via `reset_to_env_states`, frozen base:
+
+| | physx_cpu | physx_cuda | diff |
+|---|--:|--:|--:|
+| `success_once` | 0.730 | **0.557** | **-0.173** |
+| `ever_grasped` | 0.973 | 0.987 | +0.013 |
+| `ever_placed` | 0.860 | 0.783 | -0.077 |
+| `success \| placed` | 0.849 | **0.711** | **-0.138** |
+
+paired agreement **0.667** against the ~0.74 same-backend floor, 76 cpu-only vs
+24 gpu-only, McNemar chi2=26.0 p<0.001, deficit uniform across every `face_gap`
+and `dist_max` bin.
+
+**Perception is fine** — the grasp rate HOLDS (rises slightly). A rendering
+difference would have shown there, since grasping is the stage that depends on
+localising the cube. The loss is contact physics, concentrated after placement.
+**Not a config difference either**: `SceneConfig`'s solver iterations are
+shared, `sapien_env.py` does not branch on backend, StackCube does not override
+`_default_sim_config`. There is no cheap lever.
+
+**What settles it is WHERE the loss lands.** T-II's `farb` mode is defined as
+"places at near-baseline rates, then the stack does not settle" — GPU physics
+manufactures that failure globally. A `farb` residual trained there would learn
+to fix a backend artifact, and neither a positive nor a null result could be
+attributed to the method.
+
+**So T-IV trains on physx_cpu**, one residual per mode (~1M env steps) instead
+of three. Do not re-plan around GPU training without re-running the gate and
+getting a different answer.
+
+Cleared while diagnosing, so it is not re-investigated: `sapien_env.py` applies
+`set_state_dict` BEFORE `controller.reset()` (:940-975, with a comment saying
+so), so injected episodes do not start from a stale PD target.
+
+`t4/backend_check.py` (recovered from `c1c010b^`) sidesteps seeds entirely:
+`capture_states.py` reads the exact CPU initial states of the 300 committed
+nominal episodes, and the check replays them on GPU through
+`reset_to_env_states`.
 
 **The verdict is not agreement == 1.0** — DDPM sampling means identical states
 disagree even CPU-vs-CPU, floor ~0.74. What matters is whether GPU lands at the
@@ -1704,12 +1741,22 @@ not produce `seeds.csv`'s state for `s`; the training distribution is
 continuous and shares no episode with the 900 evaluation seeds. The overlap is
 distributional, which is the point.
 
-### "3 seeds" means three trained residuals, paired to the three blocks
+### "3 seeds": two designs, and we ran the cheaper one
 
-T-I and T-II read it as three blocks of 100 under three policy seeds. For T-IV
-that would leave TRAINING variance — the dominant term — unmeasured. So three
-residuals per mode, seed *b* evaluated on block *b*. Evaluation cost is
-unchanged (9 blocks per mode either way); only GPU training triples.
+T-I and T-II read it as three blocks of 100 under three policy seeds, which
+leaves TRAINING variance — usually the dominant term for PPO — unmeasured. The
+**paired** design fixes that: three residuals per mode, seed *b* evaluated on
+block *b*, so each number is an independent replicate of the whole pipeline.
+Evaluation cost is identical either way; only training triples.
+
+That was affordable on GPU and is not on CPU, so **we ran the SINGLE-residual
+design**: one residual per mode over all three blocks. Both go through the same
+code (`$RESIDUAL` with or without `{block}`). `t4/verify_t4.py` detects which
+was run, refuses the incoherent middle (two distinct residuals across three
+blocks — a mis-set `$RESIDUAL` far more often than a choice), and prints the
+caveat when it sees the single design.
+
+**The reported SD therefore excludes training variance. Say so in the report.**
 
 ### A correction to this file
 

@@ -132,6 +132,53 @@ class FakeEnvs:
         self.closed = True
 
 
+class FakeEnvsCPU(FakeEnvs):
+    """gym.vector.AsyncVectorEnv + CPUGymWrapper conventions.
+
+    Everything crossing a subprocess pipe is NUMPY, and the episode boundary is
+    reported completely differently from ManiSkillVectorEnv: final_info is an
+    OBJECT ARRAY of per-env dicts, already unbatched, rather than one batched
+    dict. Reading one shape as the other does not raise - it silently averages
+    the wrong thing - so this arm exists to make sure episode_end() handles
+    both for real, not by inspection.
+    """
+
+    def _obs(self):
+        import numpy as _np
+        return {"state": _np.random.randn(self.num_envs, OBS_H, D_STATE).astype("float32"),
+                "rgb": _np.random.randint(0, 255, (self.num_envs, OBS_H, 128, 128, 6),
+                                          dtype="uint8")}
+
+    def step(self, action):
+        import numpy as _np
+        ok(isinstance(action, _np.ndarray),
+           "physx_cpu vectorises by subprocess, so the action must be numpy")
+        ok(action.shape == (self.num_envs, ACT_DIM),
+           f"env received a per-step action, got {action.shape}")
+        ok(bool((abs(action) <= 1.0 + 1e-6).all()),
+           "every executed action is inside the [-1, 1] box")
+        self.actions_seen.append(action.copy())
+        self.t += 1
+        n = self.num_envs
+        obs = self._obs()
+        rew = _np.random.rand(n).astype("float32")
+        term = _np.zeros(n, dtype=bool)
+        trunc = _np.full(n, self.t % HORIZON == 0)
+        infos = {}
+        if trunc.any():
+            infos["_final_info"] = trunc.copy()
+            infos["final_info"] = _np.array(
+                [{"episode": {"success_once": float(_np.random.rand()),
+                              "success_at_end": float(_np.random.rand()),
+                              "return": float(_np.random.rand() * 100)}}
+                 for _ in range(n)], dtype=object)
+            infos["_final_observation"] = trunc.copy()
+            infos["final_observation"] = _np.array(
+                [{k: v[i] for k, v in obs.items()} for i in range(n)], dtype=object)
+            obs = self._obs()
+        return obs, rew, term, trunc, infos
+
+
 class FakeAgent(torch.nn.Module):
     """The surface train_rgbd.Agent presents to t4/residual.py."""
 
@@ -186,8 +233,10 @@ MADE = {}
 
 
 def _make(env_id, num_envs, **kw):
+    MADE.clear()
     MADE.update(env_id=env_id, num_envs=num_envs, **kw)
-    return FakeEnvs(num_envs)
+    cls = FakeEnvsCPU if kw.get("sim_backend") == "physx_cpu" else FakeEnvs
+    return cls(num_envs)
 
 
 _me = types.ModuleType("make_envs")
@@ -203,7 +252,7 @@ sys.path.insert(0, os.path.join(ROOT, "t2"))
 import residual as R  # noqa: E402
 import train_ppo  # noqa: E402
 
-with tempfile.TemporaryDirectory() as td:
+def run_backend(td, backend):
     ckpt = os.path.join(td, "base.pt")
     _sd = FakeAgent(None, FakeArgs()).state_dict()
     ok("visual_encoder.fc.0.weight" in _sd,
@@ -211,7 +260,7 @@ with tempfile.TemporaryDirectory() as td:
     ok(_sd["visual_encoder.fc.0.weight"].shape[1] == 8192,
        "and it is the SPATIAL shape, so the patched-encoder path is exercised")
     torch.save({"ema_agent": _sd}, ckpt)
-    out = os.path.join(td, "run")
+    out = os.path.join(td, f"run_{backend}")
 
     NE, ITERS = 4, 3
     env_per_iter = NE * (HORIZON // ACT_H) * ACT_H
@@ -220,8 +269,9 @@ with tempfile.TemporaryDirectory() as td:
                 "--total-timesteps", str(env_per_iter * ITERS),
                 "--alpha", "0.05", "--alpha-warmup", str(env_per_iter),
                 "--num-minibatches", "2", "--update-epochs", "2",
-                "--save-freq", "1", "--no-cuda"]
+                "--save-freq", "1", "--no-cuda", "--sim-backend", backend]
     train_ppo.main()
+    ok(MADE["sim_backend"] == backend, f"the {backend} branch was taken")
 
     # -- what the run should have produced ------------------------------
     ok(MADE["env_id"] == "StackCube-T4-v1", "the T-IV env id was used")
@@ -285,5 +335,13 @@ with tempfile.TemporaryDirectory() as td:
        "wall-clock and VRAM are recorded - both are named deliverables")
     ok(m["act_horizon"] == ACT_H and m["res_horizon"] == ACT_H,
        "the horizons are recorded")
+    ok(len(rows[0]) > 5 and "train/success_once" in rows[0],
+       f"{backend}: episode metrics reached the log, so episode_end() read "
+       f"this backend's final_info convention correctly")
+
+
+with tempfile.TemporaryDirectory() as td:
+    for _backend in ("physx_cpu", "physx_cuda"):
+        run_backend(td, _backend)
 
 print(f"\n{N} assertions passed.")
