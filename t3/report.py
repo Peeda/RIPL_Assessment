@@ -4,20 +4,18 @@
     python3 t3/report.py --out $T3_OUT --mode gap --figdir figures \
                          --index t2/results/seeds.csv
 
-Three figures, one per claim the T-III section makes:
+Two figures, one per deliverable:
 
   t3_sampler_<mode>.png    deliverable (b): the biased distribution against the
                            environment's own, on the axis that defines the
-                           region. This is the picture that shows the sampler
-                           did something.
+                           region. The picture that shows the sampler did
+                           something.
   t3_alignment_<mode>.png  deliverable (a): cumulative generated reward by the
                            stage each episode reached, generated beside stock.
                            If the reward is useful, the boxes step upward.
-  t3_probes_<mode>.png     the degenerate-state battery, with the completed
-                           stack marked. The bar that matters is P7_held.
 
 On the laptop:
-    nix-shell -p "python3.withPackages(ps: [ps.numpy ps.matplotlib])" \\
+    nix-shell -p "python3.withPackages(ps: [ps.numpy ps.matplotlib])" \
       --run "python3 t3/report.py --out t3/results --mode gap"
 """
 import argparse
@@ -141,30 +139,6 @@ def fig_alignment(out, mode, figdir):
     print(f"  wrote {p}")
 
 
-def fig_probes(out, mode, figdir):
-    pp = os.path.join(out, f"probes_{mode}.csv")
-    if not os.path.exists(pp):
-        return
-    r = sorted(rows(pp), key=lambda x: -float(x["reward_norm"]))
-    names = [x["probe"] for x in r]
-    vals = [float(x["reward_norm"]) for x in r]
-    cols = [GEN if n == "P0_success" else
-            ("#a03535" if n == "P7_held" else NOM) for n in names]
-
-    fig, ax = plt.subplots(figsize=(7, 3.2))
-    ax.bar(range(len(r)), vals, color=cols)
-    ax.set_xticks(range(len(r)))
-    ax.set_xticklabels(names, rotation=35, ha="right", fontsize=8)
-    ax.set_ylabel("reward (fraction of max)")
-    ax.set_title("hand-built states: a completed stack (blue) must beat every "
-                 "other,\nespecially 'held and never released' (red)",
-                 fontsize=9)
-    fig.tight_layout()
-    p = os.path.join(figdir, f"t3_probes_{mode}.png")
-    fig.savefig(p, dpi=150)
-    print(f"  wrote {p}")
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
@@ -175,7 +149,6 @@ def main():
     os.makedirs(a.figdir, exist_ok=True)
     fig_sampler(a.out, a.mode, a.figdir, a.index)
     fig_alignment(a.out, a.mode, a.figdir)
-    fig_probes(a.out, a.mode, a.figdir)
     print(f"\n  Look at them. CLAUDE.md's rule: a figure that exists is not a "
           f"figure that is right.")
 

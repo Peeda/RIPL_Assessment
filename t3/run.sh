@@ -10,35 +10,26 @@
 #
 # Stages (default: all), in dependency order:
 #
-#   test       spec / loader / gate self-tests. No sim, no GPU, no API key,
-#              ~3 s. Runs first because it is the cheapest place to find out
-#              the contract is wrong.
-#   frames     mp4 -> jpegs. Needs the ffmpeg binary only.
-#   prompt     assemble prompts/*.md + the env-source snapshot + the contract
-#              into the exact text the model is sent. Read it before generating.
+#   test       spec/loader self-tests. No sim, no GPU, no API key, ~1 s. First
+#              because it is the cheapest place to find the contract is wrong.
+#   prompt     mp4 -> frames, then assemble prompts/*.md + the env-source
+#              snapshot + the contract into the exact text the model is sent.
+#              Needs the ffmpeg binary only. READ prompt.txt before generating.
 #   generate   the one API call. Needs `anthropic` and a key. Refuses to
 #              overwrite an existing generation.
-#   lint       layer A over the artifacts. Stdlib, 0.2 s, before any sim.
-#   probes     layers B and C - shape, purity, no mutation, and the
-#              degenerate-state battery. ~2 min, no checkpoint needed.
-#   sampler    layer E - the biased distribution. ~1 min.
-#   smoke      5 episodes of align, into $T3_OUT/smoke. ~1 min, and the only
-#              way to find out the rollout path works without paying 8 minutes.
-#   align      layer D, the centrepiece - 100 real episodes of the frozen
-#              policy, scored by the generated reward. ~8 min per mode.
-#   calibrate  the same battery against ManiSkill's own 8-stage dense reward,
-#              so every AUC is a comparison rather than a bare number.
-#   verify     THE GATE. Reads only files. Exits non-zero.
-#   report     the figures.
-#
-# Roughly 25 minutes per mode on an RTX 4090, most of it in `align`.
-#
-# NOTHING IS REPORTABLE, AND NOTHING GOES INTO T-IV, UNTIL `verify` EXITS 0.
+#   lint       the static check over the artifacts. Stdlib, 0.2 s.
+#   check      the three measurements: sampler | reward | align. ~10 min,
+#              almost all of it in align.
+#   calibrate  the same battery on ManiSkill's own 8-stage dense reward, so the
+#              AUC is a comparison rather than a bare number. Optional, ~8 min.
+#   summary    read the measurements, print OK/WARN. ALWAYS EXITS 0 - a
+#              threshold missed is a finding for the report, not a refusal.
+#   report     the two figures.
 #
 # THE INPUT COMES FROM T-II. mp4s are gitignored and never present in a fresh
 # clone, so produce one first:
 #   SEEDS=$(head -2 t2/results/mode_gap_seed1.csv | tail -1 | cut -d, -f5) \
-#     bash t2/run.sh videos
+#     WANT=fail bash t2/run.sh videos
 # ==============================================================================
 set -euo pipefail
 
@@ -68,7 +59,6 @@ export ENV_ID CTRL BACKEND MAX_EP_STEPS
 export T2_RESULTS=${T2_RESULTS:-$ROOT/t2/results}
 
 FRAMES=${FRAMES:-10}
-SELECT=${SELECT:-uniform}
 EPISODES=${EPISODES:-100}
 NUM_ENVS=${NUM_ENVS:-10}
 DRAWS=${DRAWS:-4096}
@@ -87,9 +77,6 @@ on_exit() {
   echo "  is sampled and the rollouts are stochastic. Pull before you stop or"
   echo "  terminate the pod:"
   echo "      bash setup/transfer.sh info"
-  echo ""
-  echo "  A FAILED VERIFY IS A RESULT, not an accident: keep the generation, it"
-  echo "  is the report's account of how an LLM-written reward goes wrong."
   exit "$rc"
 }
 trap on_exit EXIT
@@ -128,14 +115,12 @@ need_key() {
 # --- stages ----------------------------------------------------------------
 
 do_test() {
-  stage "self-tests - the contract, layer A, and the gate. No sim, no key"
-  python3 "$HERE/test_spec.py"
-  python3 "$HERE/test_loader.py"
-  python3 "$HERE/test_verify.py"
+  stage "self-tests - the contract and the checker. No sim, no key"
+  python3 "$HERE/test_t3.py"
 }
 
-do_frames() {
-  stage "frames - $FRAMES by '$SELECT'"
+do_prompt() {
+  stage "prompt - $FRAMES frames, evenly spaced"
   if [ -z "${VIDEO:-}" ] && [ ! -d "$RUN/frames" ]; then
     echo "!! set VIDEO=/path/to/clip.mp4"
     echo ""
@@ -146,12 +131,10 @@ do_frames() {
     exit 1
   fi
   python3 "$HERE/assemble.py" --mode "$MODE" --out "$RUN" \
-    ${VIDEO:+--video "$VIDEO"} --frames "$FRAMES" --select "$SELECT" \
+    ${VIDEO:+--video "$VIDEO"} --frames "$FRAMES" \
     --seed "${VIDEO_SEED:-unknown}" --outcome "${OUTCOME:-failure}" \
-    ${WITH_STATS:+--with-stats} ${ALLOW_DRIFT:+--allow-source-drift}
+    ${WITH_STATS:+--with-stats}
 }
-
-do_prompt() { do_frames; }
 
 do_generate() {
   stage "generate - one API call"
@@ -162,65 +145,37 @@ do_generate() {
 }
 
 do_lint() {
-  stage "lint - layer A, no simulator"
+  stage "lint - the static check, no simulator"
   python3 "$HERE/loader.py" "$RUN"
 }
 
-do_probes() {
-  stage "probes - layers B and C"
-  [ -f "$HERE/fixtures/grasp_hover_states.npz" ] || {
-    find_ckpt
-    echo "  capturing the grasped-state fixture (needed for P7_held)"
-    python "$HERE/probes.py" --make-fixture "$CKPT" $STATE_FLAG
-  }
-  python "$HERE/probes.py" --run "$RUN" --mode "$MODE" --out "$OUT" $STATE_FLAG
-}
-
-do_sampler() {
-  stage "sampler - layer E, $DRAWS draws"
-  python "$HERE/sampler_check.py" --run "$RUN" --mode "$MODE" --out "$OUT" \
+do_check() {
+  stage "check - sampler, reward, align"
+  find_ckpt
+  python "$HERE/check.py" sampler --run "$RUN" --mode "$MODE" --out "$OUT" \
     --draws "$DRAWS"
-}
-
-# A separate directory on purpose: sharing $OUT would leave a 5-episode
-# align CSV that the real run's resume logic would accept as finished.
-do_smoke() {
-  stage "smoke - 5 episodes through the full rollout path, into $OUT/smoke"
-  find_ckpt
-  rm -rf "$OUT/smoke"; mkdir -p "$OUT/smoke"
-  python "$HERE/align.py" --run "$RUN" --mode "$MODE" --out "$OUT/smoke" \
-    --ckpt "$CKPT" --episodes 5 --control-episodes 2 --num-envs 5 $STATE_FLAG
-  echo ""
-  echo "  The rollout path works: env registered in every worker, seeds honoured,"
-  echo "  reward_mode=dense returning the generated reward, metrics read back."
-  echo "  (verify.py will reject this shape - 5 episodes, not $EPISODES. That is"
-  echo "   the point; it is a smoke test, not a measurement.)"
-}
-
-do_align() {
-  stage "align - layer D, $EPISODES episodes on the T-II evaluation seeds"
-  find_ckpt
-  python "$HERE/align.py" --run "$RUN" --mode "$MODE" --out "$OUT" \
+  python "$HERE/check.py" reward --run "$RUN" --mode "$MODE" --out "$OUT" \
+    $STATE_FLAG
+  python "$HERE/check.py" align --run "$RUN" --mode "$MODE" --out "$OUT" \
     --ckpt "$CKPT" --episodes "$EPISODES" --num-envs "$NUM_ENVS" $STATE_FLAG
 }
 
-# The calibration arm. Without it every AUC in the report is uncalibrated, and
-# "the LLM's reward is worse than the one it was shown" is a finding that cannot
-# be made. Runs the identical battery on ManiSkill's own dense reward.
+# The calibration arm. Without it every AUC in the report is uncalibrated. With
+# it, both outcomes are reportable - "the LLM beat the reward it was shown at
+# the failing stage" is a result, and "it did not" is a better one.
 do_calibrate() {
   stage "calibrate - the same battery on ManiSkill's 8-stage dense reward"
   find_ckpt
-  python "$HERE/probes.py" --run "$RUN" --mode "$MODE" --out "$OUT" \
+  python "$HERE/check.py" reward --run "$RUN" --mode "$MODE" --out "$OUT" \
     --reward "$HERE/fixtures/stock_reward.py" --label stock $STATE_FLAG
-  python "$HERE/align.py" --mode "$MODE" --out "$OUT" --ckpt "$CKPT" \
+  python "$HERE/check.py" align --mode "$MODE" --out "$OUT" --ckpt "$CKPT" \
     --reward "$HERE/fixtures/stock_reward.py" --label stock \
     --episodes "$EPISODES" --num-envs "$NUM_ENVS" $STATE_FLAG
 }
 
-do_verify() {
-  stage "verify - the gate"
-  python3 "$HERE/verify.py" "$OUT" --mode "$MODE" --run "$RUN" \
-    --t2-results "$T2_RESULTS"
+do_summary() {
+  stage "summary - the measurements, read back"
+  python3 "$HERE/summary.py" "$OUT" --mode "$MODE" --run "$RUN"
 }
 
 do_report() {
@@ -232,23 +187,18 @@ do_report() {
 STAGE=${1:-all}
 case "${1:-all}" in
   test)      do_test ;;
-  frames)    do_preflight; do_frames ;;
-  prompt)    do_preflight; do_prompt ;;
+  prompt|frames) do_preflight; do_prompt ;;
   generate)  do_preflight; do_generate ;;
   lint)      do_lint ;;
-  probes)    do_preflight; do_probes ;;
-  sampler)   do_preflight; do_sampler ;;
-  smoke)     do_preflight; do_smoke ;;
-  align)     do_preflight; do_align ;;
+  check)     do_preflight; do_check ;;
   calibrate) do_preflight; do_calibrate ;;
-  verify)    do_verify ;;
+  summary)   do_summary ;;
   report)    do_report ;;
-  all)       do_test; do_preflight; do_frames; do_generate; do_lint
-             do_probes; do_sampler; do_smoke; do_align; do_calibrate
-             do_verify; do_report ;;
+  all)       do_test; do_preflight; do_prompt; do_generate; do_lint
+             do_check; do_summary; do_report ;;
   # trap off first: an unknown stage is a typo, and telling someone to rescue
   # data because they mistyped is how a real warning stops being read.
-  *) trap - EXIT; sed -n '2,44p' "$SELF"; exit 1 ;;
+  *) trap - EXIT; sed -n '2,32p' "$SELF"; exit 1 ;;
 esac
 
 stage "done - artifacts in $RUN, measurements in $OUT"

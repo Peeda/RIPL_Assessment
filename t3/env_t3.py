@@ -2,41 +2,29 @@
 """StackCube-T3-v1: StackCube with the LLM's reward and the LLM's sampler.
 
 Importing this module registers the environment. Every T-III script that touches
-a simulator imports it AT MODULE SCOPE, never inside a function - physx_cpu
-vectorises by subprocess and forkserver re-imports __main__ in every child, so a
-registration that happens inside main() does not exist in the workers and
-gym.make dies there with a message about an unknown env id.
+a simulator imports it AT MODULE SCOPE - physx_cpu vectorises by subprocess and
+forkserver re-imports __main__ in every child, so a registration inside main()
+does not exist in the workers and gym.make dies there on an unknown env id.
 
-TWO ENVIRONMENT VARIABLES, AND THE SECOND ONE IS LOAD-BEARING
     T3_RUN      the generation directory holding reward.py and sampler.py.
-    T3_SAMPLER  1 (default) to draw initial states from the generated sampler,
-                0 to leave the environment's own _initialize_episode alone.
+    T3_SAMPLER  1 (default) biased initial states from the generated sampler,
+                0 leaves the environment's own _initialize_episode alone.
 
-    T3_SAMPLER=0 is not a convenience. Every evaluation in this project
-    addresses an episode by its seed, and t2/verify.py's strongest offline check
-    joins the poses logged during a rollout against an independently built seed
-    index. With the biased sampler active, reset(seed=s) no longer produces the
-    state that seeds.csv records for s - by design - and that join fails on
-    every episode. So:
+T3_SAMPLER=0 IS NOT A CONVENIENCE. Every evaluation in this project addresses an
+episode by its seed, and with the biased sampler on, reset(seed=s) no longer
+produces the state t2/results/seeds.csv records for s - by design. So
+T3_SAMPLER=1 is T-IV TRAINING ONLY; anything reproducing a T-II episode (the
+alignment measurement, T-IV's before/after scoring) needs it off. An env var
+rather than a kwarg because it must survive the forkserver boundary.
 
-        T3_SAMPLER=1   T-IV training only. A biased distribution is the point.
-        T3_SAMPLER=0   anything that has to reproduce a T-II episode: the
-                       alignment measurement, and T-IV's before/after scoring.
-
-    It is an env var rather than an env kwarg because it has to survive the
-    forkserver boundary and because t2/harness.py builds env_kwargs internally,
-    which would otherwise need a second seam.
-
-WHY SUBCLASSING, AND WHY super() FIRST
-    ManiSkill has no hook for a custom reward: BaseEnv.get_reward dispatches on
-    reward_mode to compute_dense_reward, and the way to supply one is to
-    subclass and register. _initialize_episode calls super() BEFORE overriding
-    the cube poses, so TableSceneBuilder.initialize still runs - it sets the
-    table pose, the robot's initial qpos with its configured noise, and forces
-    the gripper open. Reimplementing _initialize_episode wholesale would mean
-    synthesising all of that, and getting the robot's start pose subtly wrong is
-    exactly the kind of difference that would show up later as an unexplained
-    gap between T-III's numbers and T-II's.
+WHY SUBCLASSING, AND WHY super() FIRST. ManiSkill has no hook for a custom
+reward - BaseEnv.get_reward dispatches on reward_mode to compute_dense_reward,
+and the only supported way to supply one is to subclass and register.
+_initialize_episode calls super() BEFORE overriding the cube poses, so
+TableSceneBuilder.initialize still sets the table pose and the robot's start
+qpos. Reimplementing it wholesale would mean synthesising those, and getting the
+robot's start pose subtly wrong would surface later as an unexplained gap
+between T-III's numbers and T-II's.
 """
 import os
 import sys
@@ -67,7 +55,7 @@ def _run_dir():
 
 
 def _load(kind):
-    """The generated module, loaded once per process, through layer A.
+    """The generated module, loaded once per process, through loader.py.
 
     Static checks gate the import rather than the other way round: importing
     first would execute module-level code nobody has looked at yet.
@@ -110,10 +98,10 @@ class StackCubeT3Env(StackCubeEnv):
         with torch.device(self.device):
             out = _load("sampler")["sample_cube_poses"](b, self.device)
 
-        # Validated here as well as in layer E, because layer E checks the
-        # sampler in isolation and this is the only place that sees what the
-        # environment actually received. A malformed batch that reached
-        # set_pose would corrupt an entire training run silently.
+        # Validated here as well as in check.py, which sees the sampler in
+        # isolation. This is the only place that sees what the environment
+        # actually received, and a malformed batch reaching set_pose would
+        # corrupt an entire training run silently.
         for key, shape in (("cubeA_xyz", (b, 3)), ("cubeA_quat", (b, 4)),
                            ("cubeB_xyz", (b, 3)), ("cubeB_quat", (b, 4))):
             t = out.get(key)

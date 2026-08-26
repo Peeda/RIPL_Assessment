@@ -2,41 +2,30 @@
 """Turn an mp4 and a mode tag into the exact prompt the LLM is sent. Stdlib.
 
     python3 t3/assemble.py --mode gap --video clip.mp4 --out t3/artifacts/gap
-                           [--frames 10] [--select uniform|diverse] [--with-stats]
+                           [--frames 10] [--with-stats]
 
-Two jobs, both deliberately kept out of generate.py so that neither needs an API
-key and both can be inspected before a penny is spent:
+Two jobs, both kept out of generate.py so neither needs an API key and both can
+be inspected before a penny is spent:
 
-    1. FRAMES. Shell out to the ffmpeg binary rather than importing anything.
-       ffmpeg is already installed on the pod (setup/setup_runpod.sh) and is one
-       `nix-shell -p ffmpeg` away on the laptop, so frame extraction adds no
-       Python dependency to a repo whose analysis half runs on a bare
-       interpreter.
+    1. FRAMES, by shelling out to the ffmpeg binary rather than importing
+       anything, so frame extraction adds no Python dependency to a repo whose
+       analysis half runs on a bare interpreter.
+    2. ASSEMBLY, concatenating t3/prompts/*.md with two sections spliced in from
+       t3/spec.py - the contract and the API surface. Splicing rather than
+       duplicating is the point: the model is told exactly what t3/loader.py
+       checks, and a rule cannot be tightened without the prompt changing too.
 
-    2. ASSEMBLY. The prompt is concatenated from t3/prompts/*.md with two
-       sections spliced in from t3/spec.py - the contract and the allowed API
-       surface. Splicing rather than duplicating is the point: the model is told
-       exactly what t3/loader.py checks, and a rule cannot be tightened in the
-       checker without the prompt changing too.
+Outputs into the run directory: frames/*.jpg (what the model saw, committed as
+evidence), blocks.json (content blocks, images by path, so it stays diffable),
+prompt.txt (the whole thing rendered readable - THIS is what the report quotes),
+and prompt_manifest.json.
 
-Outputs into the run directory:
-
-    frames/frame_00.jpg ...   what the model saw, committed as evidence
-    blocks.json               the content blocks, images by path (generate.py
-                              base64s them) - so this file stays diffable
-    prompt.txt                the whole thing rendered readable, with the images
-                              marked in place. THIS is what the report quotes.
-    prompt_manifest.json      provenance: mode, video, seed, frame indices,
-                              which prompt files went in, the env-source hash.
-
-THE ENV-SOURCE HASH GATE. The environment's source is handed to the model
-Eureka-style, from a committed snapshot under t3/env_source/ rather than read
-live out of $MANISKILL_REPO. A live read cannot drift from the installed
-version but makes an old run's prompt unreproducible once the pod is gone, and
-invisible in `git diff`. A snapshot is reproducible and reviewable but rots. So:
-snapshot, plus a re-hash of the installed copy on every assembly, which refuses
-to build a prompt if the two differ. That buys both properties for the price of
-one comparison - the same move t2/harness.py:219 makes with ckpt_sha256.
+THE ENV-SOURCE HASH. The environment's source is handed to the model
+Eureka-style, from a committed snapshot rather than read live out of
+$MANISKILL_REPO: a live read is unreproducible once the pod is gone and
+invisible in `git diff`, while a snapshot rots. So snapshot plus a re-hash of
+the installed copy on every assembly, warned about and stamped into the
+manifest when they differ - the same move t2/harness.py makes with ckpt_sha256.
 """
 import argparse
 import glob
@@ -96,20 +85,6 @@ def _decode_all(video, tmp, exe):
     return sorted(glob.glob(os.path.join(tmp, "*.jpg")))
 
 
-def _thumbs(video, exe, n_frames, size=32):
-    """Every frame as `size`x`size` grayscale raw bytes, for `diverse`.
-
-    Pure bytes, compared in pure Python - no PIL, no numpy. One frame is 1 kB.
-    """
-    out = subprocess.run(
-        [exe, "-nostdin", "-loglevel", "error", "-i", video,
-         "-vf", f"scale={size}:{size},format=gray", "-f", "rawvideo", "-"],
-        check=True, stdout=subprocess.PIPE).stdout
-    step = size * size
-    frames = [out[i:i + step] for i in range(0, len(out), step)]
-    return [f for f in frames if len(f) == step][:n_frames]
-
-
 def _pick_uniform(total, n):
     """Evenly spaced, with the FIRST and LAST frames pinned.
 
@@ -124,35 +99,7 @@ def _pick_uniform(total, n):
     return sorted(set([0] + mid + [total - 1]))
 
 
-def _pick_diverse(thumbs, n):
-    """Greedy farthest-point selection over the grayscale thumbnails.
-
-    Every episode runs the full 200 steps because evaluation sets
-    ignore_terminations=True, so a uniform sample spends most of its frames on a
-    motionless tail. This spends them on the moments that differ from each
-    other: seed with the first and last frames, then repeatedly add whichever
-    frame is furthest (in mean absolute pixel difference) from everything picked
-    so far.
-    """
-    total = len(thumbs)
-    if total <= n:
-        return list(range(total))
-
-    def dist(i, j):
-        a, b = thumbs[i], thumbs[j]
-        return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
-
-    picked = [0, total - 1]
-    best = [min(dist(i, p) for p in picked) for i in range(total)]
-    while len(picked) < n:
-        nxt = max(range(total), key=lambda i: best[i] if i not in picked else -1)
-        picked.append(nxt)
-        for i in range(total):
-            best[i] = min(best[i], dist(i, nxt))
-    return sorted(picked)
-
-
-def extract_frames(video, out_dir, n, select):
+def extract_frames(video, out_dir, n):
     """-> (frame_paths, frame_indices, total_frames)."""
     exe = _ffmpeg()
     frames_dir = os.path.join(out_dir, "frames")
@@ -164,10 +111,7 @@ def extract_frames(video, out_dir, n, select):
         allf = _decode_all(video, tmp, exe)
         if not allf:
             sys.exit(f"!! ffmpeg decoded 0 frames from {video} - is it a video?")
-        if select == "diverse":
-            idx = _pick_diverse(_thumbs(video, exe, len(allf)), n)
-        else:
-            idx = _pick_uniform(len(allf), n)
+        idx = _pick_uniform(len(allf), n)
         kept = []
         for k, i in enumerate(idx):
             dst = os.path.join(frames_dir, f"frame_{k:02d}.jpg")
@@ -191,7 +135,7 @@ def _sha(path):
         return hashlib.sha256(f.read()).hexdigest()
 
 
-def env_source_text(allow_drift=False):
+def env_source_text():
     """The committed snapshot, after checking it still matches what is installed."""
     with open(ENV_SOURCE) as f:
         src = f.read()
@@ -210,22 +154,20 @@ def env_source_text(allow_drift=False):
                    f"   The prompt would describe an environment that is not the one\n"
                    f"   the reward will run in. Re-snapshot and re-generate:\n"
                    f"     cp {live} {ENV_SOURCE}   # then update PROVENANCE.json\n"
-                   f"   or pass --allow-source-drift to proceed knowingly (it is\n"
-                   f"   stamped into the manifest, so the report cannot hide it).\n")
-            if not allow_drift:
-                sys.exit(msg)
+                   f"   Proceeding anyway; the drift is stamped into the "
+                   f"manifest, so the\n   report cannot hide it.\n")
             print(msg)
     return src, prov, drift
 
 
-def assemble(mode, frame_paths, seed, outcome, with_stats, allow_drift):
+def assemble(mode, frame_paths, seed, outcome, with_stats):
     """-> (blocks, prompt_text, provenance dict).
 
     `blocks` is the content list in API order, with images carried as paths.
     generate.py base64s them at the last moment; keeping them as paths here is
     what lets blocks.json be read and diffed.
     """
-    src, prov, drift = env_source_text(allow_drift)
+    src, prov, drift = env_source_text()
 
     stable = []
     used = []
@@ -283,11 +225,9 @@ def main():
     ap.add_argument("--video")
     ap.add_argument("--out", required=True)
     ap.add_argument("--frames", type=int, default=10)
-    ap.add_argument("--select", default="uniform", choices=["uniform", "diverse"])
     ap.add_argument("--seed", default="unknown")
     ap.add_argument("--outcome", default="failure")
     ap.add_argument("--with-stats", action="store_true")
-    ap.add_argument("--allow-source-drift", action="store_true")
     a = ap.parse_args()
 
     if not os.path.exists(os.path.join(PROMPTS, f"failure_{a.mode}.md")):
@@ -320,8 +260,8 @@ def main():
 
     existing = sorted(glob.glob(os.path.join(a.out, "frames", "*.jpg")))
     if a.video:
-        paths, idx, total = extract_frames(a.video, a.out, a.frames, a.select)
-        print(f"  frames      {len(paths)} of {total} by '{a.select}': {idx}")
+        paths, idx, total = extract_frames(a.video, a.out, a.frames)
+        print(f"  frames      {len(paths)} of {total}, evenly spaced: {idx}")
     elif existing:
         paths, idx, total = existing, [], 0
         print(f"  frames      reusing {len(paths)} already in {a.out}/frames")
@@ -332,7 +272,7 @@ def main():
                  f"   mp4s are gitignored, so there is never one in a fresh clone.\n")
 
     blocks, text, prov = assemble(a.mode, paths, a.seed, a.outcome,
-                                  a.with_stats, a.allow_source_drift)
+                                  a.with_stats)
 
     with open(os.path.join(a.out, "blocks.json"), "w") as f:
         json.dump(blocks, f, indent=2)
@@ -343,7 +283,7 @@ def main():
     with open(os.path.join(a.out, "prompt_manifest.json"), "w") as f:
         json.dump(dict(mode=a.mode, video=a.video, video_seed=a.seed,
                        outcome=a.outcome, n_frames=len(paths), frame_indices=idx,
-                       total_frames=total, select=a.select,
+                       total_frames=total,
                        with_stats=a.with_stats,
                        prompt_files=prov["used"],
                        env_source=prov["prov"],
