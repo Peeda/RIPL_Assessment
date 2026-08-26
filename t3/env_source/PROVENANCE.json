@@ -1,0 +1,7 @@
+{
+  "source": "mani_skill/envs/tasks/tabletop/stack_cube.py",
+  "maniskill_commit": "62ff3a5896b4d5b4cf0ac4c8d79afe600c9404a3",
+  "maniskill_version": "3.0.1",
+  "sha256": "3aaf7ad185e689c82a78a593cf46ec37e873733080a92ef62158fc7a72236052",
+  "note": "Verbatim snapshot of the environment the LLM is asked to write a reward for. Committed rather than read live from $MANISKILL_REPO so an old run's prompt is re-derivable after the pod that produced it is gone, and so a prompt change shows up in git diff. t3/assemble.py re-hashes the installed copy against this and refuses to build a prompt if they differ."
+}
