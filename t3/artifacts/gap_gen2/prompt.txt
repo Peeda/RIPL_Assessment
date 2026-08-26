@@ -1,0 +1,610 @@
+## The environment, in full
+
+This is the complete source of the task you are writing a reward for. The
+success criterion, the existing dense reward, and the initial-state sampler you
+are being asked to bias are all in here — read them rather than assuming.
+
+```python
+from typing import Any, Union
+
+import numpy as np
+import sapien
+import torch
+
+from mani_skill.agents.robots import Fetch, Panda
+from mani_skill.envs.sapien_env import BaseEnv
+from mani_skill.envs.utils import randomization
+from mani_skill.sensors.camera import CameraConfig
+from mani_skill.utils import common, sapien_utils
+from mani_skill.utils.building import actors
+from mani_skill.utils.registration import register_env
+from mani_skill.utils.scene_builder.table import TableSceneBuilder
+from mani_skill.utils.structs.pose import Pose
+
+
+@register_env("StackCube-v1", max_episode_steps=50)
+class StackCubeEnv(BaseEnv):
+    """
+    **Task Description:**
+    The goal is to pick up a red cube and stack it on top of a green cube and let go of the cube without it falling
+
+    **Randomizations:**
+    - both cubes have their z-axis rotation randomized
+    - both cubes have their xy positions on top of the table scene randomized. The positions are sampled such that the cubes do not collide with each other
+
+    **Success Conditions:**
+    - the red cube is on top of the green cube (to within half of the cube size)
+    - the red cube is static
+    - the red cube is not being grasped by the robot (robot must let go of the cube)
+    """
+
+    _sample_video_link = "https://github.com/mani-skill/ManiSkill/raw/main/figures/environment_demos/StackCube-v1_rt.mp4"
+    SUPPORTED_ROBOTS = ["panda_wristcam", "panda", "fetch"]
+    agent: Union[Panda, Fetch]
+
+    def __init__(
+        self, *args, robot_uids="panda_wristcam", robot_init_qpos_noise=0.02, **kwargs
+    ):
+        self.robot_init_qpos_noise = robot_init_qpos_noise
+        super().__init__(*args, robot_uids=robot_uids, **kwargs)
+
+    @property
+    def _default_sensor_configs(self):
+        pose = sapien_utils.look_at(eye=[0.3, 0, 0.6], target=[-0.1, 0, 0.1])
+        return [CameraConfig("base_camera", pose, 128, 128, np.pi / 2, 0.01, 100)]
+
+    @property
+    def _default_human_render_camera_configs(self):
+        pose = sapien_utils.look_at([0.6, 0.7, 0.6], [0.0, 0.0, 0.35])
+        return CameraConfig("render_camera", pose, 512, 512, 1, 0.01, 100)
+
+    def _load_agent(self, options: dict):
+        super()._load_agent(options, sapien.Pose(p=[-0.615, 0, 0]))
+
+    def _load_scene(self, options: dict):
+        self.cube_half_size = common.to_tensor([0.02] * 3, device=self.device)
+        self.table_scene = TableSceneBuilder(
+            env=self, robot_init_qpos_noise=self.robot_init_qpos_noise
+        )
+        self.table_scene.build()
+        self.cubeA = actors.build_cube(
+            self.scene,
+            half_size=0.02,
+            color=[1, 0, 0, 1],
+            name="cubeA",
+            initial_pose=sapien.Pose(p=[0, 0, 0.1]),
+        )
+        self.cubeB = actors.build_cube(
+            self.scene,
+            half_size=0.02,
+            color=[0, 1, 0, 1],
+            name="cubeB",
+            initial_pose=sapien.Pose(p=[1, 0, 0.1]),
+        )
+
+    def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
+        with torch.device(self.device):
+            b = len(env_idx)
+            self.table_scene.initialize(env_idx)
+
+            xyz = torch.zeros((b, 3))
+            xyz[:, 2] = 0.02
+            xy = torch.rand((b, 2)) * 0.2 - 0.1
+            region = [[-0.1, -0.2], [0.1, 0.2]]
+            sampler = randomization.UniformPlacementSampler(
+                bounds=region, batch_size=b, device=self.device
+            )
+            radius = torch.linalg.norm(torch.tensor([0.02, 0.02])) + 0.001
+            cubeA_xy = xy + sampler.sample(radius, 100)
+            cubeB_xy = xy + sampler.sample(radius, 100, verbose=False)
+
+            xyz[:, :2] = cubeA_xy
+            qs = randomization.random_quaternions(
+                b,
+                lock_x=True,
+                lock_y=True,
+                lock_z=False,
+            )
+            self.cubeA.set_pose(Pose.create_from_pq(p=xyz.clone(), q=qs))
+
+            xyz[:, :2] = cubeB_xy
+            qs = randomization.random_quaternions(
+                b,
+                lock_x=True,
+                lock_y=True,
+                lock_z=False,
+            )
+            self.cubeB.set_pose(Pose.create_from_pq(p=xyz, q=qs))
+
+    def evaluate(self):
+        pos_A = self.cubeA.pose.p
+        pos_B = self.cubeB.pose.p
+        offset = pos_A - pos_B
+        xy_flag = (
+            torch.linalg.norm(offset[..., :2], axis=1)
+            <= torch.linalg.norm(self.cube_half_size[:2]) + 0.005
+        )
+        z_flag = torch.abs(offset[..., 2] - self.cube_half_size[..., 2] * 2) <= 0.005
+        is_cubeA_on_cubeB = torch.logical_and(xy_flag, z_flag)
+        # NOTE (stao): GPU sim can be fast but unstable. Angular velocity is rather high despite it not really rotating
+        is_cubeA_static = self.cubeA.is_static(lin_thresh=1e-2, ang_thresh=0.5)
+        is_cubeA_grasped = self.agent.is_grasping(self.cubeA)
+        success = is_cubeA_on_cubeB * is_cubeA_static * (~is_cubeA_grasped)
+        return {
+            "is_cubeA_grasped": is_cubeA_grasped,
+            "is_cubeA_on_cubeB": is_cubeA_on_cubeB,
+            "is_cubeA_static": is_cubeA_static,
+            "success": success.bool(),
+        }
+
+    def _get_obs_extra(self, info: dict):
+        obs = dict(tcp_pose=self.agent.tcp.pose.raw_pose)
+        if "state" in self.obs_mode:
+            obs.update(
+                cubeA_pose=self.cubeA.pose.raw_pose,
+                cubeB_pose=self.cubeB.pose.raw_pose,
+                tcp_to_cubeA_pos=self.cubeA.pose.p - self.agent.tcp.pose.p,
+                tcp_to_cubeB_pos=self.cubeB.pose.p - self.agent.tcp.pose.p,
+                cubeA_to_cubeB_pos=self.cubeB.pose.p - self.cubeA.pose.p,
+            )
+        return obs
+
+    def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: dict):
+        # reaching reward
+        tcp_pose = self.agent.tcp.pose.p
+        cubeA_pos = self.cubeA.pose.p
+        cubeA_to_tcp_dist = torch.linalg.norm(tcp_pose - cubeA_pos, axis=1)
+        reward = 2 * (1 - torch.tanh(5 * cubeA_to_tcp_dist))
+
+        # grasp and place reward
+        cubeA_pos = self.cubeA.pose.p
+        cubeB_pos = self.cubeB.pose.p
+        goal_xyz = torch.hstack(
+            [cubeB_pos[:, 0:2], (cubeB_pos[:, 2] + self.cube_half_size[2] * 2)[:, None]]
+        )
+        cubeA_to_goal_dist = torch.linalg.norm(goal_xyz - cubeA_pos, axis=1)
+        place_reward = 1 - torch.tanh(5.0 * cubeA_to_goal_dist)
+
+        reward[info["is_cubeA_grasped"]] = (4 + place_reward)[info["is_cubeA_grasped"]]
+
+        # ungrasp and static reward
+        gripper_width = (self.agent.robot.get_qlimits()[0, -1, 1] * 2).to(
+            self.device
+        )  # NOTE: hard-coded with panda
+        is_cubeA_grasped = info["is_cubeA_grasped"]
+        ungrasp_reward = (
+            torch.sum(self.agent.robot.get_qpos()[:, -2:], axis=1) / gripper_width
+        )
+        ungrasp_reward[~is_cubeA_grasped] = 1.0
+        v = torch.linalg.norm(self.cubeA.linear_velocity, axis=1)
+        av = torch.linalg.norm(self.cubeA.angular_velocity, axis=1)
+        static_reward = 1 - torch.tanh(v * 10 + av)
+        reward[info["is_cubeA_on_cubeB"]] = (
+            6 + (ungrasp_reward + static_reward) / 2.0
+        )[info["is_cubeA_on_cubeB"]]
+
+        reward[info["success"]] = 8
+
+        return reward
+
+    def compute_normalized_dense_reward(
+        self, obs: Any, action: torch.Tensor, info: dict
+    ):
+        return self.compute_dense_reward(obs=obs, action=action, info=info) / 8
+
+```
+
+Three things in that source that matter more than they look:
+
+1. **Success requires the robot to LET GO.** `evaluate()` computes
+   `success = is_cubeA_on_cubeB & is_cubeA_static & ~is_cubeA_grasped`. A cube
+   held perfectly in place on top of the other is a *failure*.
+2. **`compute_dense_reward` already exists** and is an eight-stage ladder. Your
+   reward is compared against it on the same episodes. You are not filling a
+   vacuum; you are trying to beat a competent baseline at one specific failure.
+3. **`_initialize_episode` is the sampler you are biasing.** Note the single
+   shared `xy` offset applied to *both* cubes — it cancels out of their relative
+   pose, so where the pair sits on the table is statistically independent of how
+   the two cubes are arranged relative to each other.
+
+One fact that is **not** visible in this file and that changes the problem: the
+policy acts through a `pd_ee_delta_pos` controller, which is 4-dimensional —
+three translation components and a gripper command. The end effector's
+**orientation is frozen at whatever it was on reset, for all 200 steps**. The
+wrist cannot rotate. The cubes, however, are spawned at a uniformly random yaw.
+So the gripper meets each cube at an arbitrary misalignment and cannot square up
+to it.
+
+
+## What your code may read
+
+These are what the generated code should read. Reading anything else is
+flagged for review, so stay inside this surface unless you have a reason.
+
+```
+    env.agent.robot.get_qlimits
+    env.agent.robot.get_qpos
+    env.agent.robot.get_qvel
+    env.agent.tcp.pose.p
+    env.agent.tcp.pose.q
+    env.agent.tcp.pose.raw_pose
+    env.cubeA.angular_velocity
+    env.cubeA.linear_velocity
+    env.cubeA.pose.p
+    env.cubeA.pose.q
+    env.cubeA.pose.raw_pose
+    env.cubeB.angular_velocity
+    env.cubeB.linear_velocity
+    env.cubeB.pose.p
+    env.cubeB.pose.q
+    env.cubeB.pose.raw_pose
+    env.cube_half_size
+    env.device
+    env.num_envs
+```
+
+```
+    info["is_cubeA_grasped"]
+    info["is_cubeA_on_cubeB"]
+    info["is_cubeA_static"]
+    info["success"]
+```
+
+Notes on what these are:
+
+* `.pose.p` is `(num_envs, 3)` position; `.pose.q` is `(num_envs, 4)` wxyz
+  quaternion; `.pose.raw_pose` is `(num_envs, 7)`, position then quaternion.
+* `env.cube_half_size` is a length-3 tensor, every element 0.02 — the cubes are
+  40 mm.
+* `env.agent.robot.get_qpos()` is `(num_envs, 9)` for the Panda; the last two
+  entries are the two finger joints, and their sum over the gripper width is how
+  the built-in reward measures "has the gripper opened".
+* Every `info[...]` value is a **boolean tensor of shape (num_envs,)**, not a
+  Python bool. Use them as masks.
+* `obs` and `action` are passed for completeness. `obs` is whatever the current
+  observation mode produces and **does not contain the cube poses under the RGB
+  observation mode this project uses** — read poses from `env`, never from `obs`.
+
+
+
+## How generated rewards go wrong
+
+*This file is the tuning knob of the whole pipeline. It is prompt text, not
+code, and it is versioned on its own so that `git log t3/prompts/hacking.md` is
+a readable account of what had to be said to get a usable reward — which is one
+of the things the report has to document. If a generation fails validation for a
+reason not covered here, the fix goes here first.*
+
+*It is also, deliberately, not the last line of defence. Everything below is
+advice a model can nod along to and then violate. The actual guarantee comes
+from the validator, which runs the reward against hand-built degenerate states
+and against real rollouts of the frozen policy. Prompting reduces the number of
+round trips; it does not decide anything.*
+
+Reinforcement learning will find and exploit whatever your reward literally
+says. Assume an adversary reading your code for the cheapest way to accumulate
+return without doing the task. Concretely, in this environment:
+
+**1. Rewarding the grasp is the classic trap.** Reaching and grasping are the
+easy part and the policy already does them well. A reward that pays generously
+for holding the cube makes "pick it up and hold it forever" a high-return
+policy, and the task is never completed. If you pay for grasping at all, the
+payment must be strictly smaller than what is available for placing, and placing
+must be strictly smaller than what is available for a completed stack.
+
+**2. Success here requires letting go.** Because `success` demands
+`~is_cubeA_grasped`, a reward whose maximum is reached while the cube is still
+in the gripper is directly opposed to the task. If your reward has a "cube is
+above the target" term, check what it pays when the cube is above the target
+*and still held*.
+
+**3. Do not pay per step for a state the policy can simply maintain.** Anything
+that pays a constant while the gripper hovers near the cube accumulates over 200
+steps into more return than a single successful stack is worth. Shaping terms
+should be small relative to the terms for actual progress.
+
+**4. Watch which cube is which.** `cubeA` goes on top of `cubeB`. A goal
+computed as "cubeB near cubeA" instead of "cubeA above cubeB" is a one-token
+error that produces a reward for the wrong task and is invisible in any test
+that only observes normal behaviour.
+
+**5. Distance terms need all three axes.** A term measuring only horizontal
+distance is maximised by a cube in the right place at the wrong height —
+including one that has fallen off the table.
+
+**6. Do not reward the absence of the symptom.** If the failure involves the
+target cube being disturbed, "penalise the target cube moving" is exploitable in
+a way you may not expect: the cheapest way to keep it perfectly still is to
+never approach it. Shape the *behaviour that avoids the disturbance* — clearance
+during the approach — rather than the outcome you want.
+
+**7. Your reward is stateless.** It sees only the current simulator state. It
+cannot compare anything against where that thing started, cannot integrate over
+the episode, and cannot know how many steps have elapsed. If your intended term
+needs episode history, it is not expressible here and you should say so in
+`uncertainties` rather than approximating it with something that is not the same
+quantity.
+
+**8. Keep the ladder ordered.** The clearest structure, and the one the built-in
+reward uses, is a monotone ladder of stages: approach < carry < placed <
+completed, with a bounded shaping term inside each stage that can never lift one
+rung above the next. State the ladder explicitly in your rationale, with the
+numeric band each stage occupies, so the ordering can be checked by reading.
+
+## What will be done to your reward before it is used
+
+Say what you expect to happen, in `uncertainties`, and be specific.
+
+- It is scored against hand-built states, including: a completed stack; the cube
+  held above the target and never released; the cube beside the target on the
+  table; the target knocked away; the two cubes stacked the wrong way round; the
+  cube below the table at the right horizontal position. The completed stack
+  must score highest, by a margin.
+- The reward is swept along a line as the cube is moved away from the target,
+  vertically and horizontally, and must not increase.
+- It is run as the actual reward over one hundred real episodes of the frozen
+  policy, and must rank the episodes that succeeded above the episodes that
+  failed — specifically at the stage this failure mode breaks at, not merely
+  overall. A reward that separates outcomes only because grasping predicts
+  everything downstream will be rejected.
+- The same battery is run on the environment's built-in reward, and yours is
+  reported beside it.
+
+
+## Calibrating your region against the environment's own distribution
+
+The failure mode below is described in words on purpose: what you infer about
+its *mechanism* should come from the video and the description, not from a table
+of our measurements.
+
+Its *location* is a different question, and one you can answer for yourself. A
+region is a claim about where in a distribution something sits — and you have
+been given that distribution in full. `_initialize_episode` is in the
+environment source above, with its sampler, its bounds, its rejection radius and
+the shared offset both cubes receive; `_load_agent` gives the robot base. Before
+you commit to any threshold, derive from that source:
+
+1. **The shape of the axis you are targeting.** Whatever quantity the failure
+   description points at — clearance between the cubes' faces, distance from the
+   base, something else — work out what the environment's own sampler makes of
+   it: its typical value, and how far its tail actually reaches. This is
+   arithmetic on code you have been given, not a guess.
+
+2. **How narrow the region has to be.** The base policy is competent; a failure
+   mode it hit often would not be worth training a residual against. These
+   regions are thin corners of the distribution, not halves of it. If the region
+   you have written down would capture a large share of nominal draws, you have
+   described the distribution rather than a corner of it.
+
+3. **The far end of the tail, not the near end.** Phrases like "at the edge of
+   the workspace" or "the faces are nearly touching" name an *extreme*. A region
+   that stops short of that extreme — or worse, one that sits entirely below the
+   middle of the true corner — trains the residual on the easy part of the
+   problem while it is scored on the hard part. When a bound is given to you as
+   the limit of what the environment can produce, sample up to it. Do not leave
+   yourself a safety margin inside the region you were asked to target.
+
+State this derivation in your `rationale`: which quantity you chose, what you
+worked out its nominal distribution to be, and what fraction of nominal draws
+you expect your region to capture. That last figure is checked against the
+sampler you actually wrote.
+
+
+## The failure mode: **tight face clearance** (internal tag `gap`)
+
+*Written by the engineer who measured it, from a held-out evaluation of the
+frozen base policy. Qualitative on purpose — the numbers are deliberately
+withheld so that what you infer from the video is yours.*
+
+The two cubes start close enough that there is very little clear space between
+their nearest **faces**.
+
+"Close" here is not the distance between their centres, and that distinction is
+the whole of this failure mode. Each cube is 40 mm across, but a cube presented
+corner-first spans 56.6 mm along that direction. Two cubes whose centres are a
+fixed distance apart can therefore be comfortably clear of one another or almost
+touching, depending only on how they happen to be turned. The environment
+rejects placements closer than about 59 mm centre-to-centre, so the tightest
+configurations are the ones where both cubes are turned toward each other
+corner-first — the region is as much a statement about **yaw** as about
+proximity.
+
+**What the policy does.** What collapses is getting
+the red cube onto the green one: a large share of these episodes end with the
+red cube grasped, or dropped, but never placed.
+
+**What it looks like in the video.** The gripper comes down into the narrow slot
+between the two cubes. Because the wrist orientation is frozen at reset, the
+fingers cannot rotate to line up with the gap, so a finger or the hand body
+catches the neighbouring green cube on the way down or on the way back up. The
+green cube gets shoved. Sometimes it is nudged a few millimetres and the
+attempted stack then lands off-target; sometimes it is knocked well clear, after
+which there is nothing left to stack onto. Occasionally the disturbance happens
+on the descent and the grasp itself is spoiled.
+
+**Where the policy is already fine.** Once the red cube *is* on the green one,
+these episodes hold together about as well as any other. The defect is
+specifically in the approach and placement, not in the settling.
+
+**What a fix would have to do.** Make the approach and the descent respect the
+neighbouring cube: get the gripper into and out of that slot without disturbing
+the thing being stacked onto.
+
+
+[IMAGE: t3/artifacts/gap_gen2/frames/frame_00.jpg]
+
+[IMAGE: t3/artifacts/gap_gen2/frames/frame_01.jpg]
+
+[IMAGE: t3/artifacts/gap_gen2/frames/frame_02.jpg]
+
+[IMAGE: t3/artifacts/gap_gen2/frames/frame_03.jpg]
+
+[IMAGE: t3/artifacts/gap_gen2/frames/frame_04.jpg]
+
+[IMAGE: t3/artifacts/gap_gen2/frames/frame_05.jpg]
+
+[IMAGE: t3/artifacts/gap_gen2/frames/frame_06.jpg]
+
+[IMAGE: t3/artifacts/gap_gen2/frames/frame_07.jpg]
+
+[IMAGE: t3/artifacts/gap_gen2/frames/frame_08.jpg]
+
+[IMAGE: t3/artifacts/gap_gen2/frames/frame_09.jpg]
+
+## The video
+
+The 10 images above are frames from a single episode of the trained
+policy attempting this task, in time order, sampled across the episode. The
+episode ran from initial-state seed unknown and its outcome was: **failure**.
+
+The red cube is `cubeA` — the one that must end up on top. The green cube is
+`cubeB` — the base of the stack. The arm is a Franka Panda.
+
+Two things about the frames that are easy to misread:
+
+- The episode always runs the full 200 steps. Nothing stops early, so a long
+  static tail at the end is normal and is not itself the failure.
+- The camera is fixed. Apparent motion is the scene moving, never the view.
+
+What you are looking for is *when* and *how* the attempt breaks down, and what
+about the starting configuration made it break down.
+
+
+## What to produce
+
+Two self-contained Python modules, returned through the `emit_artifacts` tool.
+
+### (a) A dense reward function targeting this failure mode
+
+It must incentivise **recovery from, or avoidance of, the failure described
+above**, and it will be used to train a small bounded residual correction on top
+of the frozen policy — the base policy's actions are not being replaced, only
+nudged by a few millimetres per step. So the reward should reward *the precision
+that the base policy is missing in this region*, not re-teach the task from
+scratch. The base policy already reaches, grasps and transports competently;
+what it gets wrong is specific and is described above.
+
+The reward is also compared, on identical episodes, against the environment's
+own eight-stage dense reward. Beating it at the stage this mode fails at is the
+bar. Reproducing it exactly is not useful; ignoring it entirely is usually worse
+than building on its structure.
+
+### (b) An episode-configuration sampler biased toward this failure regime
+
+It must draw initial cube configurations that land **inside the failure region**
+far more often than the environment's own sampler does, so that reinforcement
+learning spends its episodes on the states that matter instead of on the ~95% of
+the distribution the policy already handles.
+
+Two requirements that pull against each other, and getting the balance right is
+the substance of this half:
+
+- **Concentrated enough to be worth training on.** A sampler that reproduces the
+  nominal distribution has done nothing.
+- **Varied enough to generalise.** The residual will be *evaluated* on a fixed,
+  held-out set of episodes drawn from this same region that it has never seen.
+  A sampler that collapses onto one configuration, or onto one corner of the
+  region, produces a residual that overfits and does not transfer — and that is
+  measured, not assumed.
+
+Stay inside the environment's own support. The biased distribution must be a
+**subset** of what the environment can produce, never a superset: the frozen
+base policy has never seen anything outside it, and training on states it has
+never seen measures a distribution shift rather than a failure mode.
+
+## The interface
+
+### `reward.py` — the dense reward
+
+```python
+REWARD_MAX = 8.0            # module-level, a positive float literal
+
+def compute_reward(env, obs, action, info):
+    """-> torch.Tensor, shape (env.num_envs,), floating dtype, on env.device."""
+```
+
+Hard requirements:
+
+* Every returned value lies in `[0, REWARD_MAX]`. The env divides by
+  `REWARD_MAX` to produce a normalised reward in `[0, 1]` for PPO.
+* It is a **pure function of the current simulator state**. No randomness, no
+  module-level counters, no state carried between calls. It is called once per
+  `env.step()` for every parallel environment at once, and calling it twice on
+  the same state must return bitwise identical values.
+* It **must not mutate anything** reachable from `env`. A reward that moves a
+  cube and then collects the bonus for the cube being moved is rejected.
+* Fully batched. No `if` on a tensor, no `.item()`, `.cpu()`, `.numpy()` or
+  `.tolist()` — those force a GPU→CPU sync on every step of training. Use
+  `torch.where`, boolean masks, and in-place masked assignment.
+* Parameter names must be exactly `env, obs, action, info`, in that order.
+
+### `sampler.py` — the episode-configuration sampler
+
+```python
+def sample_cube_poses(b, device):
+    """-> dict with exactly these four keys, torch.float32 on `device`:
+
+           cubeA_xyz  (b, 3)   z must equal 0.02 exactly
+           cubeA_quat (b, 4)   wxyz, unit norm, rotation about z ONLY (x = y = 0)
+           cubeB_xyz  (b, 3)
+           cubeB_quat (b, 4)
+    """
+```
+
+Hard requirements:
+
+* Draw randomness with `torch.rand` / `torch.randn` / `torch.randint` **only**.
+  The caller has already entered `with torch.device(device)`, so a bare
+  `torch.rand((b, 2))` lands on the right device — exactly as the environment's
+  own `_initialize_episode` does it. `random` and `numpy.random` are forbidden:
+  the environment seeds `torch`'s generator and nothing else, so drawing from
+  anywhere else silently destroys `reset(seed=s)` reproducibility.
+* Both cubes lie inside the nominal support: `x ∈ [-0.2, 0.2]`,
+  `y ∈ [-0.3, 0.3]`, `z = 0.02`. The biased distribution must be a
+  **subset** of the distribution the base policy was trained on — otherwise the
+  residual is being asked to handle a distribution shift rather than a failure.
+* Centre-to-centre separation ≥ `0.05857` m for every row. That is the
+  environment's own rejection-sampling floor for 40 mm cubes; below it the cubes
+  physically overlap.
+* Both cubes within `0.868` m of the Panda base at `(-0.615, 0.0)`. That
+  is the far corner of the support box above, not an extra constraint — it is
+  simply how far the environment itself can place a cube. **Do not back off from
+  it.** Where the arm struggles is a property of the failure mode you were given,
+  not of this bound, and treating the bound as a wall to stay clear of will put
+  your region in the wrong place.
+* Rejection sampling must use a **bounded `for`**, never a `while`. Fall back to
+  the last valid draw if the budget runs out; never return an invalid row.
+* The draws must be **varied**. A sampler that returns one configuration hits
+  the target region 100% of the time and teaches the policy nothing that
+  generalises.
+* Parameter names must be exactly `b, device`, in that order.
+
+### Both files
+
+* Import **only** `torch` and `math`, at module level. Nothing else — no
+  `numpy`, no `os`, no `random`.
+* No classes, no decorators, no `while` loops, no `global`.
+* Under 400 lines each.
+* Self-contained: the two files do not import each other.
+
+
+## One call
+
+You get **one** tool call. There is no follow-up turn, no review round, and no
+chance to fill anything in later: what you return is written to disk as
+`reward.py` and `sampler.py` and executed against the simulator as-is. A field
+containing the word `placeholder` becomes a file containing the word
+`placeholder`.
+
+So return all four fields complete in the same call, and finish the reward
+before you start the sampler — the reward is the harder of the two and it is
+the one T-IV actually trains against.
+
+## Also return
+
+- `rationale`: why each term is there, what mechanism from the video and the
+  description it addresses, and — for the reward — the explicit stage ladder
+  with the numeric band each stage occupies.
+- `uncertainties`: what you are least sure of, which term you would expect an
+  optimiser to exploit first, and what you predict will happen when the
+  validation described above is run. Be specific; this is read.

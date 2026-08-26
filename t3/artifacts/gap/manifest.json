@@ -1,0 +1,18 @@
+{
+  "model": "claude-opus-5",
+  "stop_reason": "tool_use",
+  "request_id": null,
+  "attempts": 1,
+  "wall_seconds": 562.0,
+  "input_tokens": 6854,
+  "output_tokens": 46463,
+  "thinking_tokens": 29112,
+  "field_attempt": {
+    "reward_py": 1,
+    "sampler_py": 1,
+    "rationale": 1,
+    "uncertainties": 1
+  },
+  "loadable": true,
+  "anthropic_version": "1.0.0"
+}
