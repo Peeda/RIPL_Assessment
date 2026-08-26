@@ -298,6 +298,21 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "t2"))
 import harness  # noqa: E402
 
+# to_device must survive BOTH backends. physx_cpu hands back numpy; physx_cuda
+# hands back CUDA tensors, and np.asarray on one of those raises - which would
+# make t4/backend_check.py, the script that licenses training on GPU, unable to
+# run at all. No GPU is needed to catch it: a plain torch tensor takes the same
+# branch a CUDA one would.
+_t = torch.randn(2, 3)
+ok(harness.to_device(_t, "cpu") is not None, "to_device passes a tensor through")
+ok(harness.to_device({"a": _t}, "cpu")["a"].shape == (2, 3),
+   "to_device handles a dict of tensors without going via numpy")
+ok(harness.to_device({"a": {"b": _t}}, "cpu")["a"]["b"].shape == (2, 3),
+   "and nests")
+import numpy as _np  # noqa: E402
+ok(harness.to_device({"a": _np.zeros((2, 3), dtype=_np.float32)}, "cpu")["a"].shape
+   == (2, 3), "and still accepts numpy, which is what physx_cpu returns")
+
 os.environ.pop("RESIDUAL", None)
 ok(harness.residual_path() is None, "no RESIDUAL -> no residual")
 ok(harness.residual_path(1) is None, "no RESIDUAL -> none per block either")

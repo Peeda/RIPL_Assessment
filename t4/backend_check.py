@@ -165,8 +165,10 @@ def main():
         steps, done = 0, False
         while not done and steps < MAX_EP_STEPS:
             with torch.no_grad():
+                # Stays on the GPU. ManiSkillVectorEnv takes tensors, and a
+                # .cpu() here would force a device sync every chunk - 25 per
+                # episode across 300 episodes, for nothing.
                 chunk = agent.get_action(to_device(obs, device))
-            chunk = chunk.detach().cpu().numpy()
             for i in range(chunk.shape[1]):
                 obs, rew, term, trunc, info = envs.step(chunk[:, i])
                 steps += 1

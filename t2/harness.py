@@ -255,9 +255,18 @@ def build_agent(ckpt_path, state_mode, num_envs, device=None, video_dir=None,
 
 
 def to_device(obs, device):
-    """Observations come back as numpy (physx_cpu) in either dict or array form."""
+    """Observations -> torch on `device`, whatever backend produced them.
+
+    physx_cpu hands back numpy through CPUGymWrapper; physx_cuda hands back CUDA
+    tensors from ManiSkillVectorEnv, and `np.asarray` on one of those RAISES
+    ("can't convert cuda:0 device type tensor to numpy"). So tensors pass
+    through untouched and only non-tensors go via numpy. The CPU path is
+    unchanged; this is what makes t4/backend_check.py able to run at all.
+    """
     if isinstance(obs, dict):
-        return {k: torch.as_tensor(np.asarray(v)).to(device) for k, v in obs.items()}
+        return {k: to_device(v, device) for k, v in obs.items()}
+    if isinstance(obs, torch.Tensor):
+        return obs.to(device)
     return torch.as_tensor(np.asarray(obs)).to(device)
 
 
