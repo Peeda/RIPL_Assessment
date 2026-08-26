@@ -49,7 +49,7 @@ PROVENANCE = os.path.join(HERE, "env_source", "PROVENANCE.json")
 # Assembly order. The first group is IDENTICAL for every mode and every run, so
 # it is one cacheable prefix; everything volatile comes after it. See
 # generate.py, which puts the cache breakpoint at the end of the stable block.
-STABLE = ["env_source.md", "api_surface.md", "hacking.md"]
+STABLE = ["env_source.md", "api_surface.md", "hacking.md", "calibration.md"]
 VOLATILE_HEAD = ["failure_{mode}.md"]          # + stats.md when --with-stats
 VOLATILE_TAIL = ["frames.md", "task.md"]       # after the images
 

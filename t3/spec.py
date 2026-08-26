@@ -116,11 +116,22 @@ SUPPORT_Y = (-0.3, 0.3)
 # so the enforced floor on CENTRE separation is twice that.
 MIN_SEPARATION = 2 * (math.dist((0.0, 0.0), (0.02, 0.02)) + 0.001)   # 0.05857
 
-# Above this the IK saturates and no bounded residual recovers a target the arm
-# cannot reach: T-II measured grasp 0.815 above 740 mm. Not 0.76 - mode `farb`
-# deliberately wants dist_B >= 0.76, so the ceiling sits above the region it
-# guards.
-REACH_MAX = 0.80
+# DERIVED FROM THE SUPPORT, never assumed. This was hard-coded at 0.80 on the
+# reasoning that the IK saturates beyond it, and that was wrong twice over:
+#
+#   - The environment's own sampler produces distances up to 0.8515 over 25,000
+#     seeds (1.0% of placements exceed 0.80), so 0.80 does not describe the
+#     support it claimed to describe.
+#   - 19.5% of the measured `farb` episodes have dist_B > 0.80. The contract
+#     therefore forbade the model from sampling a fifth of the very region it
+#     was being asked to target, and check.py's `reach_bad` counted a correct
+#     sampler's rows as invalid. Both sides of the same wrong number.
+#
+# The real bound is the corner of the support box, which is where the
+# environment can actually place a cube. Anything the env can produce, the
+# sampler may produce; that is the whole of the constraint.
+PANDA_BASE = (-0.615, 0.0)
+REACH_MAX = math.dist(PANDA_BASE, (SUPPORT_X[1], SUPPORT_Y[1]))      # 0.86846
 
 # ---------------------------------------------------------------------------
 # thresholds - advisory, see the module docstring
@@ -326,8 +337,12 @@ Hard requirements:
 * Centre-to-centre separation ≥ `{MIN_SEPARATION:.5f}` m for every row. That is the
   environment's own rejection-sampling floor for 40 mm cubes; below it the cubes
   physically overlap.
-* Both cubes within {REACH_MAX} m of the Panda base at `(-0.615, 0.0)`. Beyond that
-  the arm's IK saturates and no bounded residual can help.
+* Both cubes within `{REACH_MAX:.3f}` m of the Panda base at `(-0.615, 0.0)`. That
+  is the far corner of the support box above, not an extra constraint — it is
+  simply how far the environment itself can place a cube. **Do not back off from
+  it.** Where the arm struggles is a property of the failure mode you were given,
+  not of this bound, and treating the bound as a wall to stay clear of will put
+  your region in the wrong place.
 * Rejection sampling must use a **bounded `for`**, never a `while`. Fall back to
   the last valid draw if the budget runs out; never return an invalid row.
 * The draws must be **varied**. A sampler that returns one configuration hits
