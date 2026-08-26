@@ -127,9 +127,7 @@ env.sh
 # account of how an LLM-written reward fails. .jpg and .json are tracked by
 # omission; this comment exists so nobody adds a blanket rule that catches them.
 #
-# t3/fixtures/grasp_hover_states.npz is a few kB of simulator state captured
-# from one real rollout, and is covered by the !*_states.npz negation above. It
-# is the only way to build a GRASPED probe state - see t3/README.md.
+# t3/results/ holds the measurements check.py writes and summary.py reads.
 
 # mp4s stay ignored (*.mp4 above). Reference them from the report; they are
 # regenerable from a seed with record_seeds.py.

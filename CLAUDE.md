@@ -626,23 +626,45 @@ numbers, and what each check proves. This table is only the file map.
 ### `t3/` — the LLM pipeline
 
 **Read `t3/README.md` first.** Same shape as `t2/`: a stdlib core that defines
-what "acceptable" means, a sim half that measures, and a gate that decides.
+what "acceptable" means, a sim half that measures, and a stdlib half that reads
+the measurements back.
 
 | | |
 |---|---|
-| `spec.py` | The contract, the thresholds, the statistics (`auc`, `se_null_auc`). **Pure stdlib.** Renders the prompt's contract section, drives the checker, and holds every number the gate applies. |
-| `loader.py` | Layer A: the AST walk, and a guarded `exec`. Stdlib. Five consumers. |
+| `spec.py` | The contract, the thresholds, the statistics (`auc`, `se_null_auc`). **Pure stdlib.** Renders the prompt's contract section AND drives the checker. |
+| `loader.py` | The AST walk and a guarded `exec`. Stdlib. Returns `(errors, warnings)`. |
 | `assemble.py` | Frames (via the `ffmpeg` binary) and prompt assembly. Stdlib. |
 | `prompts/*.md`, `env_source/` | **The prompts. A deliverable — quote them from here.** |
 | `generate.py` | The one API call. The only file that imports `anthropic`. |
 | `env_t3.py` | `@register_env("StackCube-T3-v1")`. The whole integration surface. |
-| `probes.py` | Layers B and C: shape/purity/no-mutation, and the degenerate-state battery. |
-| `sampler_check.py` | Layer E: the biased distribution. Needs torch, not ManiSkill. |
-| `align.py` | **Layer D, the centrepiece.** 100 real episodes, scored by the generated reward. |
-| `verify.py` | **The gate.** Reads only files. Exits non-zero. |
-| `report.py` | Three figures. |
-| `test_spec.py`, `test_loader.py`, `test_verify.py` | 35 fixtures and 21 corruptions. No deps, ~3 s. |
-| `run.sh` | The one driver. `test | frames | prompt | generate | lint | probes | sampler | smoke | align | calibrate | verify | report | all`. |
+| `check.py` | The three measurements: `sampler` \| `reward` \| `align`. ManiSkill. |
+| `summary.py` | Reads what `check.py` wrote, prints OK/WARN, **exits 0.** Stdlib. |
+| `report.py` | Two figures. |
+| `test_t3.py` | The contract and the checker. No deps, ~1 s. |
+| `run.sh` | The one driver. `test | prompt | generate | lint | check | calibrate | summary | report | all`. |
+
+**`summary.py` is a separate file from `check.py` on purpose.** `check.py` must
+`import env_t3` at module scope so the forkserver workers register the
+environment, which drags ManiSkill in; the summary is what the report quotes and
+has to run on the laptop's bare interpreter. Do not merge them to save a file.
+
+### T-III was cut down, deliberately — do not rebuild the gate
+
+It was originally five validation layers: a nine-state degenerate-state probe
+battery with monotonicity sweeps, a 500-line gate that exited non-zero, and a
+suite that corrupted a fabricated pass 21 ways to prove the gate caught each.
+~2,100 lines of checking, none of which had ever seen a real generation.
+
+That was the wrong instrument. A reward scoring 0.72 where the threshold said
+0.75 is a sentence in the report, not a reason to block T-IV, and every refusal
+costs a regeneration cycle to learn what the number already said. **Every
+threshold is now advisory: `summary.py` prints WARN and exits 0.** The only
+refusal left is an artifact that will not load.
+
+Three checks were lost outright and `t3/README.md` §4 names them: a swapped goal
+argument, "hold the cube up forever", and a reward blind to the z axis. The
+first and third have no substitute other than reading `reward.py`. That is a
+weaker claim than the battery made and it is the accepted trade.
 
 **The split at `geometry.py` / `harness.py` is the load-bearing structural
 call**, and it replaces an optional-import dance that did not work. `t2_common.py`
@@ -924,12 +946,16 @@ is load-bearing and Blackwell cards already have an open ManiSkill issue.
   section.
 - **T-III's pipeline and sampler are implemented and self-tested; no
   generation has been run yet.** `t3/` mirrors `t2/`'s shape: a stdlib contract
-  (`spec.py`) rendered into the prompt AND enforced by the checker, a five-layer
-  validator, and a gate that exits non-zero. Self-tests pass on the laptop with
-  the bare interpreter: 35 loader fixtures and **21 gate corruptions, each
-  caught for the right reason**. What is *not* done: no mp4 exists in the repo
-  (they are gitignored), so no prompt has been assembled against real frames and
-  no API call has been made. Method in `t3/README.md`.
+  (`spec.py`) rendered into the prompt AND read by the checker, three
+  measurements that write files, and a summary that reads them back. Self-tests
+  pass on the laptop with the bare interpreter (`python3 t3/test_t3.py`, 30
+  assertions). What is *not* done: no mp4 exists in the repo (they are
+  gitignored), so no prompt has been assembled against real frames and no API
+  call has been made. Method in `t3/README.md`.
+- **`t3/` was cut from ~4,850 lines to ~2,750** after the checking outgrew the
+  thing it was checking. The gate, the probe battery and the gate's own test
+  suite are gone; thresholds now print WARN and exit 0. See the T-III section
+  for what that costs.
 - **Next, in order:**
   1. `bash setup/apply_patches.sh` on the pod (after `setup_runpod.sh`, which
      re-clones ManiSkill and wipes the patch).
@@ -938,9 +964,11 @@ is load-bearing and Blackwell cards already have an open ManiSkill issue.
      deliverable AND T-III's only input; nothing in `t3/` runs without one.
   3. `bash t2/run.sh report` — the T-II figures, now that the eval is done.
   4. `MODE=gap VIDEO=<clip>.mp4 bash t3/run.sh all`, then the same for `farb`.
-     **`t3/verify.py` must exit 0 before any T-III number is reported or any
-     reward is used for T-IV.**
-  5. Pull before stopping the pod: `bash setup/transfer.sh info`. Figures do
+     `summary` exits 0 even with WARNs — **read them before using the reward for
+     T-IV**, and put them in the report either way.
+  5. Then T-IV: the residual seam in `t2/harness.build_agent`. See "Reusing this
+     harness for T-IV" below for what transfers and what does not.
+  6. Pull before stopping the pod: `bash setup/transfer.sh info`. Figures do
      **not** come back by git; the pod never pushes.
 
 ---
@@ -1096,13 +1124,16 @@ otherwise be re-litigated.
 An LLM will always produce a reward function that runs, returns finite numbers,
 and comes with a persuasive rationale. None of that is evidence it would help.
 So the deliverable's substance is a definition of "acceptable" precise enough to
-check mechanically, plus a gate that applies it:
+check mechanically:
 
 > A useful reward **ranks real episodes by their real outcome, at the stage the
 > failure mode actually breaks at.**
 
-`generate.py` is 250 lines. The checking is five layers and four files. That
-ratio is the finding, not an accident, and it belongs in the report.
+**The checking was originally five layers and 2,100 lines, and that was too
+much.** It is now three measurements and a printed summary. The arc — built as a
+gate, cut back because the gate blocked the work it existed to support — is
+itself a finding about validating LLM-generated code, and it belongs in the
+report rather than the commit log.
 
 ### What the model is given — Eureka-style, not a stats dump
 
@@ -1120,12 +1151,13 @@ knob; everything else is stable.
 
 The contract and API-surface sections are **rendered from `spec.py`**, the same
 module the checker reads. A rule cannot be tightened without the model being
-told, and `test_spec.py` asserts it.
+told about it.
 
-The environment source is a **committed snapshot with a run-time hash gate**
+The environment source is a **committed snapshot with a run-time hash check**
 (`t3/env_source/`). A live read is unreproducible off-pod and invisible to `git
 diff`; a snapshot rots. Re-hashing the installed copy on every assembly buys
-both. Same move as `ckpt_sha256`.
+both — it warns and stamps the drift into the manifest. Same move as
+`ckpt_sha256`.
 
 ### Two contract decisions that are load-bearing
 
@@ -1171,13 +1203,14 @@ pair for free. At T-II's measured stage rates for `gap` (96 grasped, 66 placed,
 52 successful of 100) the floor is `52*30 / (66*30) = 0.788`, already above the
 0.70 threshold — **a reward paying nothing for placement would pass it.**
 
-The binding check is `spec.ALIGN_STAGE_GAP_FRAC`: the mean return must rise from
-`grasped, not placed` to `placed, not success` to `success`, with a margin. A
-grasp-farming reward inverts the first step however large its success bonus.
-The conditional AUC is kept and reported because it is a graded number worth
-having; it is not what the gate leans on.
+The test that works is `spec.ALIGN_STAGE_GAP_FRAC`: the mean return must rise
+from `grasped, not placed` to `placed, not success` to `success`, with a margin.
+A grasp-farming reward inverts the first step however large its success bonus.
+Verified against a fabricated one — unconditional AUC 1.000, ladder
+`70.0 < 60.2 < 94.6`, flagged. **Do not "restore" a conditional AUC as the stage
+test.**
 
-### A grasped probe state cannot be injected
+### A grasped state cannot be injected, which is why one check is missing
 
 `Panda.is_grasping` reads pairwise **contact forces** from the last physics step
 (`panda.py:225-253` → `scene.py:821-833`). After a reset plus `set_pose` with no
@@ -1185,11 +1218,13 @@ stepping there are no contacts, so `is_cubeA_grasped` is **False in every
 hand-injected state** — and "cubeA held above cubeB and never released", the
 canonical consequence of a grasp-heavy reward, is precisely a grasped state.
 
-So `P7_held` is restored from a state dict captured during a real rollout
-(`probes.py --make-fixture`, saved to `t3/fixtures/grasp_hover_states.npz`,
-covered by `.gitignore`'s `!*_states.npz`), stepped twice with the gripper
-closing, and the flag is **asserted** to have come back. `verify.py` fails if it
-did not, rather than scoring a mislabelled state.
+Testing it therefore needs a state dict captured from a real rollout, restored,
+and stepped with the gripper closing until the flag comes back. That machinery
+existed and was removed with the rest of the probe battery, so **the harness no
+longer checks for a hold-forever reward directly**; the stage ladder covers it
+partially, since `placed < success` drops if the reward pays for holding. This
+paragraph stays so the limitation is not rediscovered from scratch by someone
+writing a probe that silently scores a mislabelled state.
 
 ### Always run the calibration arm
 
