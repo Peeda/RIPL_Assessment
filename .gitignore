@@ -28,6 +28,20 @@ runs/
 # git' has no cheap undo once it is in history.
 !checkpoints/stackcube_rgb_spatial_800demos.pt
 !checkpoints/README.md
+
+# ...and one more: the T-IV residual heads. Same argument as the base policy -
+# they are the T-IV deliverable, the weights every after-number came from, and
+# `runs/` above would otherwise swallow them exactly as `checkpoints/*` swallowed
+# the whole of T-III's generated output. ~1.7 MB each (416k params), six of them.
+#
+# NARROW BY NAME again: train_ppo.py writes only residual_seed<n>.pt into this
+# directory, so a stray checkpoint or a wandb dump beside it stays ignored.
+!t4/runs/
+!t4/runs/*/
+!t4/runs/*/residual_seed?.pt
+!t4/runs/*/*_train.csv
+!t4/runs/*/*_manifest.json
+t4/runs/smoke/
 outputs/
 logs/
 
