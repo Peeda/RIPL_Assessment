@@ -130,7 +130,7 @@ def load_weights(agent, sd):
 
 
 def build_agent(ckpt_path, state_mode, num_envs, device=None, video_dir=None,
-                max_episode_steps=200, expose_poses=True):
+                max_episode_steps=200, expose_poses=True, reward_mode="sparse"):
     """The full checkpoint -> (agent, envs, args, device) path, shared by every
     script that runs a policy.
 
@@ -178,7 +178,12 @@ def build_agent(ckpt_path, state_mode, num_envs, device=None, video_dir=None,
     if expose_poses:
         wrappers = wrappers + [lambda e: CubePoseInfo(e, max_episode_steps)]
 
-    env_kwargs = dict(control_mode=ctrl, reward_mode="sparse", obs_mode=obs_mode,
+    # reward_mode defaults to sparse, which is what every T-II number was
+    # measured under and must stay. T-III overrides it to "dense" so the env
+    # returns the LLM-generated reward and CPUGymWrapper's record_metrics sums
+    # it into info['episode']['return'] for free - which is how the alignment
+    # measurement gets cumulative reward without a second rollout loop.
+    env_kwargs = dict(control_mode=ctrl, reward_mode=reward_mode, obs_mode=obs_mode,
                       render_mode="rgb_array",
                       human_render_camera_configs=dict(shader_pack="default"),
                       max_episode_steps=max_episode_steps)
