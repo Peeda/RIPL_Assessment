@@ -68,6 +68,12 @@ ALPHA=${ALPHA:-0.05}
 # scaling with alpha is why the alpha ramp alone did not protect the base
 # policy; see t4/README.md section 3.
 LOG_STD=${LOG_STD:--2.5}
+# Upstream ppo.py's 3e-4. Raised here only with evidence: the first 1M-step run
+# left the head at its near-zero init (approx_kl ~1e-4, and a paired eval of the
+# result moved gap block 1 by -0.010), so the mean was not moving at all. The
+# head is ~420k params with a critic already at EV 0.6-0.8, and target_kl 0.1
+# catches an overshoot.
+LR=${LR:-3e-4}
 RES_HORIZON=${RES_HORIZON:-0}
 # physx_cpu vectorises by SUBPROCESS, so this is a process count, not a batch
 # width. It buys nothing above the core count.
@@ -253,7 +259,7 @@ do_train() {
       --sim-backend "$TRAIN_BACKEND" \
       --total-timesteps "$TOTAL_STEPS" --alpha "$ALPHA" \
       --alpha-warmup "$ALPHA_WARMUP" --res-horizon "$RES_HORIZON" \
-      --log-std-init "$LOG_STD" ${TRACK:+--track}
+      --log-std-init "$LOG_STD" --learning-rate "$LR" ${TRACK:+--track}
   done
 }
 
