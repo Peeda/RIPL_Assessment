@@ -60,6 +60,14 @@ AFTER=${T4_AFTER:-$RESULTS/after_$MODE}
 # report must say that the SD excludes TRAINING variance.
 SEEDS=${SEEDS:-1}
 ALPHA=${ALPHA:-0.05}
+# The EXPLORATION scale, and the thing the alpha ramp does NOT bound. The head
+# samples raw ~ N(mu, exp(LOG_STD)) per axis PER ENV STEP, so at the -1.0 that
+# upstream ppo.py uses the per-step perturbation is 0.368 * alpha = 1.84 mm and
+# the random walk over a 200-step episode is 1.84*sqrt(200) = 26 mm - larger
+# than the <20 mm face clearance that DEFINES mode `gap`. Exploration noise
+# scaling with alpha is why the alpha ramp alone did not protect the base
+# policy; see t4/README.md section 3.
+LOG_STD=${LOG_STD:--3.0}
 RES_HORIZON=${RES_HORIZON:-0}
 # physx_cpu vectorises by SUBPROCESS, so this is a process count, not a batch
 # width. It buys nothing above the core count.
@@ -244,7 +252,8 @@ do_train() {
       --out "$RUNS/$MODE" --num-envs "$NUM_ENVS" \
       --sim-backend "$TRAIN_BACKEND" \
       --total-timesteps "$TOTAL_STEPS" --alpha "$ALPHA" \
-      --alpha-warmup "$ALPHA_WARMUP" --res-horizon "$RES_HORIZON" ${TRACK:+--track}
+      --alpha-warmup "$ALPHA_WARMUP" --res-horizon "$RES_HORIZON" \
+      --log-std-init "$LOG_STD" ${TRACK:+--track}
   done
 }
 

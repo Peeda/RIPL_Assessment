@@ -218,6 +218,54 @@ Two honest caveats:
 
 ---
 
+## 3b. MEASURED: the α ramp bounds the residual but NOT the exploration
+
+The first two 1M-step runs both got **worse**, and they got worse in exactly
+the shape the α ramp draws: `train/success_once` fell from ~0.45 to ~0.25 over
+the first ~200k steps — the warmup window — then sat flat for the remaining
+800k. `train/reward` tracked it down in lockstep, which is worth stating on its
+own: **T-III's generated reward agrees with success**, so the reward is not
+what is wrong. PPO was driving its own objective down.
+
+The cause is that `α_t = α·min(t/H, 1)` scales the residual's MEAN and its
+NOISE together. The head samples `raw ~ N(μ, exp(log_std))` independently per
+axis per env step, so the executed perturbation is `α·tanh(raw)` and its spread
+is proportional to α. At upstream `ppo.py`'s `log_std_init = -1.0`:
+
+| `log_std` | σ | mm/step at α=5 mm | random walk over 200 steps |
+|---|--:|--:|--:|
+| **−1.0** | 0.368 | 1.84 | **26.0 mm** |
+| −2.0 | 0.135 | 0.68 | 9.6 |
+| −2.5 | 0.082 | 0.41 | 5.8 |
+| **−3.0** | 0.050 | 0.25 | **3.5 mm** |
+
+26 mm of undirected drift, against a 40 mm cube, on a task whose xy success
+tolerance is 33 mm — and mode `gap` is *defined* by a face clearance under
+20 mm. **The exploration noise was larger than the feature the residual exists
+to correct.** `LOG_STD` now defaults to −3.0.
+
+This sharpens section 2's finding rather than replacing it. Policy Decorator's
+ε schedule was doing two things at once, and only one of them survived the port:
+
+| | ε schedule (PD, SAC) | α ramp (ours, PPO) |
+|---|---|---|
+| bounds the residual early | yes | yes |
+| **keeps most trajectories clean** | **yes** — runs `π_base` alone w.p. 1−ε | **no** — every step is perturbed |
+
+PD gets undamaged episodes in the buffer for free; the α ramp perturbs every
+step of every episode and merely scales how much. Off-policy RL can afford the
+Dirac mixture, on-policy cannot (section 2), so the on-policy substitute has to
+buy clean-ish trajectories a different way — by starting the Gaussian narrow
+enough that the noise is small against the task's own length scale. That is a
+quantity to compute from the environment, not a default to inherit.
+
+**Read the training curve as the BEHAVIOUR policy.** Evaluation calls
+`head.act(..., deterministic=True)`, i.e. the mean with no sampling, so a
+degraded `train/success_once` does not by itself imply a degraded deliverable —
+if μ stayed near zero the deterministic residual is closer to a no-op than to a
+regression. Run the eval before concluding anything about the residual; that is
+the measurement the report quotes.
+
 ## 4. α is a bound in metres
 
 `pd_ee_delta_pos` maps a normalised ±1 to ±0.1 m (`panda.py:105-106`), so
