@@ -287,6 +287,32 @@ if μ stayed near zero the deterministic residual is closer to a no-op than to a
 regression. Run the eval before concluding anything about the residual; that is
 the measurement the report quotes.
 
+## 3c. `log_std` and the learning rate are COUPLED through 1/σ²
+
+Measured the expensive way. After 3b, run 2 lowered `log_std` to −2.5 **and**
+raised the LR to 1e-3, on the reasoning that the head had never left its
+initialisation. `losses/approx_kl` came back at **3–12** against
+`target_kl = 0.1`, and training success fell to ~0.05 by 100k steps.
+
+The KL a given weight step produces scales as 1/σ², because the log-density is
+that much sharper:
+
+| `log_std` | σ | 1/σ² |
+|---|--:|--:|
+| −1.0 | 0.368 | 7.39 |
+| −2.5 | 0.082 | **148.41 (20×)** |
+
+So narrowing the exploration IS a step-size increase — 20× of one. Raising the
+LR on top double-counted it. `target_kl` does not save you: `approx_kl` is
+evaluated at the start of a minibatch and the guard breaks before applying that
+update (`train_ppo.py:455-459`), so it bounds how long an iteration continues,
+not how far a single step goes.
+
+**Change one of the two at a time, and read `approx_kl` as the instrument.**
+Run 1 at (σ=0.368, 3e-4) gave ~1e-4 — the head barely moved. The same LR at
+σ=0.082 predicts ~2e-3, which is a normal PPO range and 20× more movement,
+with no LR change at all.
+
 ## 4. α is a bound in metres
 
 `pd_ee_delta_pos` maps a normalised ±1 to ±0.1 m (`panda.py:105-106`), so
