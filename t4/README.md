@@ -230,19 +230,30 @@ what is wrong. PPO was driving its own objective down.
 The cause is that `α_t = α·min(t/H, 1)` scales the residual's MEAN and its
 NOISE together. The head samples `raw ~ N(μ, exp(log_std))` independently per
 axis per env step, so the executed perturbation is `α·tanh(raw)` and its spread
-is proportional to α. At upstream `ppo.py`'s `log_std_init = -1.0`:
+is proportional to α. Sizes, at α = 5 mm, with `tanh`'s compression measured
+rather than linearised:
 
-| `log_std` | σ | mm/step at α=5 mm | random walk over 200 steps |
-|---|--:|--:|--:|
-| **−1.0** | 0.368 | 1.84 | **26.0 mm** |
-| −2.0 | 0.135 | 0.68 | 9.6 |
-| **−2.5** | 0.082 | 0.41 | **5.8 mm** |
-| −3.0 | 0.050 | 0.25 | 3.5 |
+| `log_std` | σ | mm/step | mm by chunk end (8 steps open-loop) | mm over 200 (unopposed bound) |
+|---|--:|--:|--:|--:|
+| **−1.0** (what ran) | 0.368 | **1.65** | **4.66** | 23.3 |
+| −2.0 | 0.135 | 0.66 | 1.88 | 9.4 |
+| **−2.5** (new default) | 0.082 | **0.41** | **1.15** | 5.8 |
+| −3.0 | 0.050 | 0.25 | 0.70 | 3.5 |
 
-26 mm of undirected drift, against a 40 mm cube, on a task whose xy success
-tolerance is 33 mm — and mode `gap` is *defined* by a face clearance under
-20 mm. **The exploration noise was larger than the feature the residual exists
-to correct.** `LOG_STD` now defaults to **−2.5** — 4.5× below the level
+**The middle column is the operative one.** `pd_ee_delta_pos` has
+`use_target = False` (`panda.py:103-112`; the `use_target` variants are the
+separate `pd_ee_target_delta_pos` mode), so each action is a displacement from
+the CURRENT measured EE pose (`pd_ee_pose.py:110-113`) and command error does
+not integrate. Executed displacements still accumulate, but only until the
+frozen base re-plans — every 8 env steps, from an observation that includes the
+perturbed `tcp_pose` — and then the base steers back. So the 200-step column is
+an upper bound that ignores the closed loop, not a prediction; the honest figure
+is ~4.7 mm of accumulated error by the end of each open-loop chunk, partly
+corrected at each boundary.
+
+A second mechanism needs no net displacement at all: the base is a diffusion
+policy trained by IL on smooth motion-planner trajectories, and per-step jitter
+puts it on TCP paths unlike anything in its demonstrations. `LOG_STD` now defaults to **−2.5** — 4.5× below the level
 measured to do harm, while keeping more exploration than −3.0, because a
 residual that learns nothing is as useless a T-IV result as one that degrades.
 
