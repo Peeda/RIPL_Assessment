@@ -41,7 +41,8 @@ import numpy as np
 import torch
 
 from geometry import cube_features
-from harness import build_agent, flag, to_device
+from harness import (attach_residual, build_agent, flag,  # noqa: E402
+                     residual_path, to_device)
 
 MAX_EP_STEPS = int(os.environ.get("MAX_EP_STEPS", 200))
 
@@ -67,6 +68,24 @@ def main():
     # reachable through envs.envs[0].
     agent, envs, args, device = build_agent(ckpt, state_mode, 1, video_dir=out_dir,
                                             max_episode_steps=MAX_EP_STEPS)
+    # build_agent always wraps in ResidualAgent but attaches NOTHING; only
+    # eval_modes.py does that, per block. Without this the T-IV "after" clips
+    # would silently show the BASE policy - the same footage as the "before"
+    # pass, captioned as the residual. $RESIDUAL may not contain '{block}' here:
+    # a video pass has no block, so there is no sane value to substitute.
+    rp = os.environ.get("RESIDUAL", "").strip()
+    if rp and "{block}" in rp:
+        sys.exit(f"\nRESIDUAL={rp} contains '{{block}}', which a video pass "
+                 f"cannot resolve.\nName the file explicitly, e.g. "
+                 f"RESIDUAL={rp.replace('{block}', '1')}\n")
+    rp = residual_path()
+    if rp:
+        rm = attach_residual(agent, rp, device)
+        print(f"  residual   {rp}\n             "
+              + "  ".join(f"{k}={v}" for k, v in sorted(rm.items())))
+    else:
+        print("  residual   none - recording the FROZEN BASE policy")
+
     rec = envs.envs[0]
     while not hasattr(rec, "flush_video"):
         rec = rec.env
