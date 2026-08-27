@@ -236,13 +236,23 @@ is proportional to α. At upstream `ppo.py`'s `log_std_init = -1.0`:
 |---|--:|--:|--:|
 | **−1.0** | 0.368 | 1.84 | **26.0 mm** |
 | −2.0 | 0.135 | 0.68 | 9.6 |
-| −2.5 | 0.082 | 0.41 | 5.8 |
-| **−3.0** | 0.050 | 0.25 | **3.5 mm** |
+| **−2.5** | 0.082 | 0.41 | **5.8 mm** |
+| −3.0 | 0.050 | 0.25 | 3.5 |
 
 26 mm of undirected drift, against a 40 mm cube, on a task whose xy success
 tolerance is 33 mm — and mode `gap` is *defined* by a face clearance under
 20 mm. **The exploration noise was larger than the feature the residual exists
-to correct.** `LOG_STD` now defaults to −3.0.
+to correct.** `LOG_STD` now defaults to **−2.5** — 4.5× below the level
+measured to do harm, while keeping more exploration than −3.0, because a
+residual that learns nothing is as useless a T-IV result as one that degrades.
+
+**PPO will not find this on its own.** Inverting `losses/entropy` for the
+1M-step `gap` run (diagonal Gaussian, d = `res_horizon`×3 = 24, so
+`H = d·(log σ + ½log 2πe)`): 10.030 → 9.585 is `log_std` −1.001 → −1.020,
+i.e. σ 0.3675 → 0.3608 over a million steps. A 2% reduction. With
+`ent_coef = 0` nothing holds the noise up, and the policy gradient still did
+not pay to quiet it — so the exploration scale is a number to set, not one to
+anneal.
 
 This sharpens section 2's finding rather than replacing it. Policy Decorator's
 ε schedule was doing two things at once, and only one of them survived the port:

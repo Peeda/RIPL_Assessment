@@ -67,7 +67,7 @@ ALPHA=${ALPHA:-0.05}
 # than the <20 mm face clearance that DEFINES mode `gap`. Exploration noise
 # scaling with alpha is why the alpha ramp alone did not protect the base
 # policy; see t4/README.md section 3.
-LOG_STD=${LOG_STD:--3.0}
+LOG_STD=${LOG_STD:--2.5}
 RES_HORIZON=${RES_HORIZON:-0}
 # physx_cpu vectorises by SUBPROCESS, so this is a process count, not a batch
 # width. It buys nothing above the core count.
